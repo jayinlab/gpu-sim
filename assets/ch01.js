@@ -49,7 +49,7 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
   const act = {
     write() {
       if ((s.w + 1) % N === s.r) {
-        return render('<b>꽉 찼어요.</b> 한 칸만 더 쓰면 wptr이 rptr과 같아져 「비었다」와 구별할 수 없어요. 그래서 링은 한 칸을 늘 비워 둬요. CP가 읽어서 rptr이 움직여야 드라이버가 다시 쓸 수 있어요.');
+        return render('<b>꽉 찼어요.</b> 한 칸만 더 쓰면 wptr이 rptr과 같아져 「비었다」와 구별할 수 없어요. 그래서 이 장난감 링은 한 칸을 늘 비워 둬요. CP가 읽어서 rptr이 움직여야 드라이버가 다시 쓸 수 있어요.');
       }
       s.n++;
       const job = Math.ceil(s.n / 2);
@@ -62,7 +62,7 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
       if (s.d === s.w) return render('새로 쓴 게 없어요. 초인종을 울려도 CP가 읽을 칸은 늘지 않아요.');
       const k = (s.w - s.d + N) % N;
       s.d = s.w;
-      render('<b>딩동.</b> doorbell에 wptr을 적어서 새 칸 ' + k + '개를 알렸어요. 이제 CP가 파란 칸을 읽을 수 있어요.');
+      render('<b>딩동.</b> doorbell에 wptr을 적어서 새 칸 ' + k + '개를 알렸어요. CP가 새 wptr을 알게 돼서 파란 칸을 읽을 수 있어요.');
     },
     read() {
       if (s.r === s.d) {
@@ -109,7 +109,8 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
     stopAuto();
     const p = params();
     s = { p, phase: 0, pending: p.wgs, cu: Array.from({ length: CUS }, () => []), done: 0, ticks: 0, wgSeq: 0, fence: 0, err: null };
-    if (p.wpg > CAP) s.err = 'workgroup 하나가 wave ' + p.wpg + '개라 CU 하나(장난감 값 ' + CAP + '칸)에 다 못 앉아요. 한 workgroup은 한 CU에 모여야 하거든요. local을 줄여 보세요.';
+    if (p.gws % p.lws) s.err = 'global ' + p.gws + '이 local ' + p.lws + '로 나누어떨어지지 않아요. 이 장난감 모델은 global이 local의 배수인 1차원 입력만 다뤄요(마지막 workgroup이 덜 찬 경우는 OpenCL 버전과 구현에 따라 따로 처리해요).';
+    else if (p.wpg > CAP) s.err = 'workgroup 하나가 wave ' + p.wpg + '개라 CU 하나(장난감 값 ' + CAP + '칸)에 다 못 앉아요. 한 workgroup은 한 CU에 모여야 하거든요. local을 줄여 보세요. 실제로는 자리 수만이 아니라 기기 한계와 VGPR·SGPR·LDS 사용량이 함께 정해요.';
     render();
   }
 
@@ -170,11 +171,11 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
     switch (ph) {
       case 'idle': return 'global ' + p.gws + ', local ' + p.lws + ', wave' + p.ws + '이면 workgroup <b>' + p.wgs + '개</b>, workgroup당 wave <b>' + p.wpg + '개</b>, 모두 <b>' + totalWaves() + ' wave</b>예요. 「다음 박자」로 시작해요.';
       case 'enqueue': return '앱이 <b>clEnqueueNDRangeKernel</b>을 불렀어요. 런타임은 「이 dispatch를 큐 끝에 추가」만 해 둬요. GPU는 아직 아무것도 몰라요.';
-      case 'umd': return 'UMD가 IB에 <b>PM4 패킷</b>을 적어요. SET_SH_REG로 커널 주소, 자원(VGPR·SGPR·LDS), workgroup 크기(' + p.lws + '), 인자 포인터를 정하고, <b>DISPATCH_DIRECT x=' + p.wgs + '</b>로 끝내요. 아직 메모리에 적힌 글자일 뿐이에요.';
-      case 'submit': return '<b>clFlush</b>(또는 clFinish)가 제출을 일으켜요. KMD가 링에 <b>INDIRECT_BUFFER</b>(IB 주소)와 <b>RELEASE_MEM</b>(끝나면 fence 주소에 1을 써)을 적어요.';
-      case 'doorbell': return 'KMD가 <b>doorbell</b>에 새 wptr을 적어요. 여기서 처음으로 GPU가 「일이 왔다」는 걸 알아요.';
+      case 'umd': return 'UMD가 IB에 <b>PM4 패킷</b>을 적어요. SET_SH_REG로 커널 코드 위치, 자원(VGPR·SGPR·LDS), workgroup 크기(' + p.lws + '), user-data 값을 정하고, <b>DISPATCH_DIRECT x=' + p.wgs + '</b>로 끝내요. 아직 메모리에 적힌 글자일 뿐이에요.';
+      case 'submit': return '<b>clFlush</b>(또는 clFinish)가 제출을 일으켜요. KMD가 링에 <b>INDIRECT_BUFFER</b>(IB 주소)와 <b>RELEASE_MEM</b>(끝나면 fence 주소에 1을 써)을 적어요. 여기선 IB 하나·fence 하나로 줄여 그려요.';
+      case 'doorbell': return 'KMD가 <b>doorbell</b>에 새 wptr을 적어요. 여기서 처음으로 CP가 새 wptr, 곧 「일이 왔다」는 걸 알아요.';
       case 'cp-ib': return 'CP(MEC)가 링에서 INDIRECT_BUFFER를 읽고 <b>IB로 건너가요</b>.';
-      case 'cp-regs': return 'CP가 SET_SH_REG를 차례로 실행해 <b>compute 레지스터</b>를 채워요. clSetKernelArg로 정해 둔 것들이 이제 하드웨어 레지스터 값이 됐어요.';
+      case 'cp-regs': return 'CP가 SET_SH_REG를 차례로 실행해 <b>compute 레지스터</b>를 채워요. 커널 인자는 드라이버 ABI에 따라 user-data 레지스터에 바로, 또는 그 레지스터가 가리키는 메모리를 거쳐 커널에 닿아요.';
       case 'dispatch': return 'CP가 <b>DISPATCH_DIRECT</b>를 만나 디스패처에 「workgroup ' + p.wgs + '개」를 넘겨요. 디스패처는 workgroup을 wave ' + p.wpg + '개로 나눠 자리가 남은 CU에 통째로 앉혀요.';
       case 'run': {
         const r = s.last;
@@ -184,7 +185,7 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
         return t;
       }
       case 'eop': return '마지막 wave까지 끝났어요(박자 ' + s.ticks + '번). 다음 박자에 CP가 <b>RELEASE_MEM</b>을 처리해 fence를 써요.';
-      case 'host': return '<b>fence = 1</b>이 메모리에 쓰였어요(필요하면 인터럽트도 올려요). 「fence ≥ 1」을 기다리던 <b>clFinish가 깨어나요</b>. 한 dispatch의 일생이 끝났어요.';
+      case 'host': return '<b>fence = 1</b>이 메모리에 쓰였어요(필요하면 인터럽트도 올려요). 드라이버가 이걸 보고 제출이 끝났다는 걸 알고, 기다리던 <b>clFinish가 돌아와요</b>. 한 dispatch의 일생이 끝났어요.';
     }
   }
 
@@ -196,7 +197,7 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
     L.app.append(
       chip('clEnqueueNDRangeKernel', at('enqueue') ? 'done' : 'dim'),
       chip('clFlush', at('submit') ? 'done' : 'dim'),
-      chip(at('host') ? 'clFinish 깨어남' : 'clFinish: fence ≥ 1 기다림', at('host') ? 'done' : at('submit') ? 'on' : 'dim'));
+      chip(at('host') ? 'clFinish 돌아옴' : 'clFinish: 끝나기를 기다림', at('host') ? 'done' : at('submit') ? 'on' : 'dim'));
 
     const ibOn = at('umd');
     const regsDone = at('dispatch');
@@ -323,12 +324,12 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
       } else if (cur.k === 'fence') {
         if (!s.fenceArmed) { s.fenceArmed = true; log('CP: RELEASE_MEM 접수 — 앞의 일이 다 끝나면 fence=1'); }
         if (liveOf('A') + liveOf('B') > 0) note = '<b>RELEASE_MEM</b>은 접수됐어요. 앞의 wave ' + (liveOf('A') + liveOf('B')) + '개가 끝나야(end-of-pipe) fence를 써요.';
-        else { s.fence = 1; s.pc++; log('fence=1 기록 → clFinish 깨어남'); }
+        else { s.fence = 1; s.pc++; log('fence=1 기록 → clFinish 돌아옴'); }
       }
     }
     if (s.fence) {
-      note = '<b>fence = 1.</b> clFinish가 깨어났어요. ' + (s.race
-        ? '<b>그런데 B의 wave ' + s.race + '개는 A가 끝나기 전에 출발했어요.</b> B가 A의 결과를 덜 쓰인 채로 읽었을 수 있어요. fence는 「전부 끝났다」만 알려 주고, 안의 순서는 지켜 주지 않아요. barrier를 켜고 다시 해 보세요.'
+      note = '<b>fence = 1.</b> clFinish가 돌아왔어요. ' + (s.race
+        ? '<b>그런데 B의 wave ' + s.race + '개는 A가 끝나기 전에 출발했어요.</b> B가 A의 결과를 덜 쓰인 채로 읽을 수 있는 조건이에요. fence는 「전부 끝났다」만 알려 주고, 안의 순서는 지켜 주지 않아요. barrier를 켜고 다시 해 보세요.'
         : 'B는 A가 모두 끝난 뒤에만 출발했어요. 대신 A의 마지막 wave를 기다리는 동안 CU가 놀았던 박자가 있었을 거예요. 안전과 바쁨의 맞교환이에요.');
       stopAuto();
     }
@@ -356,7 +357,7 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
     if (s.race) L.out.lastChild.style.borderColor = 'var(--bad)';
 
     L.host.append(el('span', 'memcell' + (s.fence ? ' hit' : ''), 'fence 주소: ' + s.fence));
-    L.host.append(el('span', 'waiter ' + (s.fence ? 'free' : 'blocked'), s.fence ? 'clFinish: 깨어남' : 'clFinish: fence ≥ 1 기다림'));
+    L.host.append(el('span', 'waiter ' + (s.fence ? 'free' : 'blocked'), s.fence ? 'clFinish: 돌아옴' : 'clFinish: 끝나기를 기다림'));
 
     say.innerHTML = note;
     logEl.textContent = s.log.join('\n');
@@ -395,7 +396,7 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
       q: '드라이버가 링에 패킷을 썼는데 doorbell을 안 울렸어요. CP는?',
       a: ['그 패킷을 읽는다', '모른다 — 알린 wptr까지만 읽는다', '링이 꽉 찼다고 판단한다'],
       r: 1,
-      why: 'CP는 doorbell로 알려 준 wptr까지만 읽어요. 써 놓는 것과 알리는 것은 다른 일이에요.',
+      why: '이 링 모델에서는 CP가 doorbell로 알려 준 wptr까지만 읽어요. 써 놓는 것과 알리는 것은 다른 일이에요.',
     },
     {
       q: 'workgroup 크기(local size)는 PM4에서 어디에 들어갈까요?',
@@ -411,9 +412,9 @@ const chip = (text, state) => el('span', 'chip' + (state ? ' ' + state : ''), te
     },
     {
       q: 'fence가 1이 됐다면, 같은 제출 안의 커널 B가 커널 A의 결과를 제대로 읽었다고 말할 수 있을까요?',
-      a: ['그렇다 — fence가 순서를 보장한다', '아니다 — 그건 A와 B 사이의 barrier가 정한다', '그렇다 — CP는 dispatch가 끝나야 다음 패킷을 읽는다'],
+      a: ['그렇다 — fence가 순서를 보장한다', '아니다 — 그건 A와 B 사이의 실행·메모리 동기화가 정한다', '그렇다 — CP는 dispatch가 끝나야 다음 패킷을 읽는다'],
       r: 1,
-      why: 'fence는 「여기까지 전부 끝났다」만 알려 줘요. CP는 dispatch 뒤 기다리지 않고 다음 패킷으로 가니, A와 B 사이 순서는 barrier가 지켜요.',
+      why: 'fence는 「여기까지 전부 끝났다」만 알려 줘요. CP는 dispatch 뒤 기다리지 않고 다음 패킷으로 가니, A→B 의존성은 둘 사이의 알맞은 실행·메모리 동기화가 지켜요. OpenCL in-order 큐라면 런타임·드라이버가 그걸 보장해요.',
     },
   ];
   QS.forEach((item, qi) => {
