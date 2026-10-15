@@ -8,14 +8,30 @@
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
-<main>
+<main class="wide">
 <h1>GPU Sim</h1>
 <p class="lead">GPU를 드라이버 쪽에서 봐요. 앱이 부른 한 줄이 Queue와 PM4 패킷을 거쳐 CU의 wave가 되기까지를 손으로 넘겨 보는 장들이에요. 이해한 만큼만 만들고, 한 장씩 늘려 가요.</p>
-<ul class="toc">
-  <li><span class="num">01</span><a href="ch01/">커맨드가 Queue를 거쳐 CU에 닿기까지</a><span class="desc">링 버퍼와 doorbell · PM4 패킷 · dispatch 하나의 일생 · barrier와 fence</span></li>
-  <li class="soon"><span class="num">02</span>다음 장 — 아직 정하지 않았어요</li>
-</ul>
-<footer><p>공부 기록 블로그: <a href="https://jayinlab.github.io/">jayinlab.github.io</a></p></footer>
+
+<section class="gmap-box" data-gmap="index">
+  <div>
+    <div class="gmap-wrap"></div>
+    <div class="gmap-legend">
+      <span><i class="m"></i>장이 주로 다룬 칸</span>
+      <span><i class="t"></i>스쳐 간 칸</span>
+      <span><i class="e"></i>아직 빈 땅</span>
+    </div>
+    <p class="gmap-note">실선은 명령이 흘러가는 길이에요. 점선 「IB를 따라감」은 CP가 링의 <code>INDIRECT_BUFFER</code> 패킷을 읽고 IB로 건너가는 것, 「완료 관찰」은 호스트가 fence를 보고 대기를 푸는 거예요. 세 띠는 물리적인 자리가 아니라 역할 구분이에요. 링은 GPU가 읽는 메모리 속 큐이고, doorbell은 제출을 알리는 창구예요.</p>
+  </div>
+  <div>
+    <ul class="gmap-chapters"></ul>
+    <div class="gmap-panel" aria-live="polite"></div>
+  </div>
+</section>
+
+<footer>
+<p>Claude가 만들고 OCL(GPT)이 사실을 검토해요. 공부 기록 블로그: <a href="https://jayinlab.github.io/">jayinlab.github.io</a></p>
+</footer>
 </main>
+<script src="assets/map.js"></script>
 </body>
 </html>
