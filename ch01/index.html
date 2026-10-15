@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1장 · Queue에서 CU까지</title>
+<meta name="description" content="clEnqueueNDRangeKernel 한 줄이 링 버퍼·PM4·CP를 거쳐 CU의 wave가 되기까지를 한 박자씩 넘겨 보는 장.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+
+<p class="crumb"><a href="../">GPU Sim</a> · 1장</p>
+<h1>커맨드가 Queue를 거쳐 CU에 닿기까지</h1>
+<p class="lead"><code>clEnqueueNDRangeKernel</code> 한 줄을 부르면 GPU는 언제, 무엇을 받아서, 어떻게 일을 시작할까요? 이 장은 그 길을 다섯 정거장으로 나누고, 각 정거장을 손으로 넘겨 봐요.</p>
+
+<div class="note">이 장은 <b>리눅스 amdgpu 커널 드라이버를 거쳐 PM4 명령을 내는 길</b>(Vulkan 드라이버나 Mesa가 쓰는 길)을 따라가요. ROCm(HIP, ROCm OpenCL)은 사용자 공간 큐에 AQL 패킷을 직접 쓰는 다른 길이에요. 숫자(CU 4개, CU당 wave 8칸 등)는 보기 쉽게 줄인 장난감 값이에요.</div>
+
+<h2>1. 다섯 정거장</h2>
+
+<p>OpenCL을 쓰는 쪽에서 보면 <code>clEnqueueNDRangeKernel</code>은 「출발!」이 아니에요. 컨베이어 벨트에 상자를 하나 올리는 일이에요. 상자가 실제로 GPU에 닿는 건 <code>clFlush</code>나 <code>clFinish</code>, 아니면 런타임이 알아서 정한 때예요. 그 사이에 상자는 다섯 정거장을 지나가요.</p>
+
+<ol>
+<li><b>런타임 / UMD</b>(user-mode driver): 커널 하나를 실행하려면 GPU 레지스터에 무엇을 써야 하는지 알아요. 그 내용을 <b>PM4 패킷</b>으로 바꿔 메모리의 명령 버퍼(<b>IB</b>, indirect buffer)에 차곡차곡 적어요.</li>
+<li><b>KMD</b>(kernel-mode driver, amdgpu): 제출을 받아서 GPU와 같이 쓰는 <b>링 버퍼</b>에 「저 IB를 실행해」라는 패킷 하나와 「끝나면 이 숫자를 써」라는 fence 패킷을 적어요.</li>
+<li><b>Doorbell</b>: KMD가 「여기까지 썼어」를 GPU에 알리는 초인종이에요. 링의 쓰기 위치(wptr)를 doorbell에 적으면 CP가 깨어나요.</li>
+<li><b>CP</b>(command processor, compute는 <b>MEC</b>): 링을 읽어 IB로 건너가고, 패킷을 하나씩 해석해 레지스터를 채운 뒤 dispatch를 시작해요.</li>
+<li><b>CU</b>(compute unit): 디스패처가 workgroup을 wave로 나눠 CU에 앉혀요. 여기서부터가 커널 코드가 실제로 도는 곳이에요. 모두 끝나면 CP가 fence 값을 메모리에 써서 「끝났다」를 알려요.</li>
+</ol>
+
+<h2>2. 링 버퍼 — 쓰는 쪽과 읽는 쪽</h2>
+
+<p>링 버퍼는 크기가 정해진 배열을 원처럼 돌려 쓰는 큐예요. 쓰는 쪽(드라이버)은 <b>wptr</b>을, 읽는 쪽(CP)은 <b>rptr</b>을 들고 있어요. 둘이 같으면 비었다는 뜻이에요. wptr이 한 칸만 더 가면 rptr을 따라잡는 상태가 꽉 찬 상태예요.</p>
+
+<p>핵심은 <b>써 놓는 것과 알리는 것이 다르다</b>는 점이에요. 드라이버가 링에 패킷을 써도 doorbell을 울리기 전까지 CP는 그 칸이 있는지 몰라요. 직접 해 보세요.</p>
+
+<div class="sim" id="sim-ring">
+  <div class="sim-title">시뮬레이터 1 · 링 버퍼와 doorbell</div>
+  <div class="ring"></div>
+  <div class="legend">
+    <span><i style="background:var(--warn-soft);border-color:var(--warn)"></i>썼지만 CP는 모름</span>
+    <span><i style="background:var(--accent-soft);border-color:var(--accent)"></i>CP가 볼 수 있음</span>
+    <span><i style="background:var(--ok-soft);border-color:var(--ok)"></i>CP가 읽음</span>
+    <span><b class="ptr-r">R</b> rptr · <b class="ptr-w">W</b> wptr · <b class="ptr-d">D</b> doorbell에 알린 wptr</span>
+  </div>
+  <div class="controls">
+    <button data-act="write" class="primary">드라이버: 패킷 쓰기</button>
+    <button data-act="bell">doorbell 울리기</button>
+    <button data-act="read">CP: 한 칸 읽기</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="say"></div>
+</div>
+
+<p>패킷을 여러 개 쓰고 doorbell을 한 번만 울려도 돼요. 실제 드라이버도 그렇게 해요. 초인종은 비싸지 않지만 공짜도 아니라서, 한 번 제출에 쓴 걸 모아서 한 번에 알려요. <code>clFlush</code>가 「이제 진짜 보내」인 이유가 여기 있어요. 런타임이 모아 둔 걸 이때 제출하고, 제출 끝에 초인종이 울려요.</p>
+
+<h2>3. PM4 — GPU가 읽는 명령의 모양</h2>
+
+<p>PM4는 AMD GPU의 CP가 읽는 명령 형식이에요. compute에서 주로 쓰는 건 <b>type-3 패킷</b>이고, 머리(header) 한 dword에 「무슨 명령인지(opcode)」와 「뒤에 몇 dword가 따라오는지」가 들어 있어요. 커널 하나를 dispatch하는 IB는 대략 이렇게 생겼어요.</p>
+
+<ul>
+<li><code>SET_SH_REG</code> — compute 레지스터에 값을 써요. 커널 코드 주소(<code>COMPUTE_PGM_LO/HI</code>), wave 하나가 쓸 VGPR·SGPR 수와 LDS 크기(<code>COMPUTE_PGM_RSRC1/2</code>), workgroup 크기(<code>COMPUTE_NUM_THREAD_X/Y/Z</code>), 커널 인자가 놓인 곳의 포인터(<code>COMPUTE_USER_DATA_n</code>)가 여기서 정해져요.</li>
+<li><code>DISPATCH_DIRECT</code> — 「workgroup을 x×y×z개 띄워」라는 출발 신호예요. 앞에서 채운 레지스터를 그대로 쓰기 때문에 이 패킷 자체는 짧아요.</li>
+</ul>
+
+<p>그리고 KMD가 링에 적는 쪽에는 두 가지가 있어요.</p>
+
+<ul>
+<li><code>INDIRECT_BUFFER</code> — 「저 주소에 있는 IB를 읽고 와」. CP는 링에서 이 패킷을 만나면 IB로 건너가 끝까지 읽고 돌아와요.</li>
+<li><code>RELEASE_MEM</code> — 「앞의 일이 파이프라인 끝까지 다 끝나면(end-of-pipe) 이 주소에 이 값을 써」. 이게 <b>fence</b>예요. 드라이버와 앱은 이 값이 올라갔는지를 보고 끝났다는 걸 알아요.</li>
+</ul>
+
+<div class="note fact">OpenCL 시선으로 다시 보면 이래요. <code>clCreateKernel</code>·<code>clSetKernelArg</code>로 미리 정해 둔 것들이 <code>SET_SH_REG</code>의 값이 되고, gws/lws가 <code>DISPATCH_DIRECT</code>의 개수와 <code>NUM_THREAD</code>가 돼요. 「이 개념은 GPU에게 무엇을 미리 확정시키는가」라는 질문의 답이 레지스터 목록인 셈이에요.</div>
+
+<h2>4. dispatch 하나의 일생</h2>
+
+<p>이제 처음부터 끝까지 한 박자씩 넘겨 봐요. global size와 local size를 바꾸면 workgroup 수와 wave 수가 달라져요. CU 자리가 모자라면 남은 workgroup은 자리가 날 때까지 기다려요.</p>
+
+<div class="sim" id="sim-life">
+  <div class="sim-title">시뮬레이터 2 · clEnqueue부터 fence까지</div>
+  <div class="controls">
+    <label class="inline">global <input type="number" data-k="gws" value="4096" min="64" max="16384" step="64"></label>
+    <label class="inline">local <input type="number" data-k="lws" value="256" min="32" max="512" step="32"></label>
+    <label class="inline">wave <select data-k="ws"><option>64</option><option>32</option></select></label>
+  </div>
+  <div class="lanes">
+    <div class="lane"><div class="lane-name">앱 · 런타임</div><div class="lane-body" data-lane="app"></div></div>
+    <div class="lane"><div class="lane-name">UMD · IB</div><div class="lane-body" data-lane="ib"></div></div>
+    <div class="lane"><div class="lane-name">KMD · 링</div><div class="lane-body" data-lane="ring"></div></div>
+    <div class="lane"><div class="lane-name">CP (MEC)</div><div class="lane-body" data-lane="cp"></div></div>
+    <div class="lane"><div class="lane-name">CU</div><div class="lane-body" data-lane="cu"></div></div>
+    <div class="lane"><div class="lane-name">메모리</div><div class="lane-body" data-lane="mem"></div></div>
+  </div>
+  <div class="controls">
+    <button data-act="next" class="primary">다음 박자</button>
+    <button data-act="auto">자동</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="say"></div>
+</div>
+
+<p>두 가지를 눈여겨보세요. 첫째, <b>한 workgroup의 wave들은 같은 CU에 모여요</b>(RDNA의 WGP 모드에선 같은 WGP). 같은 workgroup끼리 LDS를 나눠 쓰고 barrier로 서로를 기다려야 하기 때문이에요. 둘째, wave를 앉힐 수 있는지는 <b>자리 수만이 아니라 자원으로 정해져요</b>. wave 하나가 VGPR·SGPR·LDS를 얼마나 쓰는지가 <code>COMPUTE_PGM_RSRC</code>에 적혀 있고, 디스패처는 CU에 그만큼이 남아 있어야 wave를 내려보내요. 여기서는 그걸 「CU당 8칸」으로 줄였어요.</p>
+
+<h2>5. Fence와 순서</h2>
+
+<p>fence는 <b>계속 커지기만 하는 숫자</b>예요. 제출할 때마다 「이번엔 fence가 N이 되면 끝난 것」이라고 정해 두고, GPU는 일이 끝나면 그 자리에 N을 써요. <code>clFinish</code>는 결국 「fence가 N 이상이 될 때까지 기다리기」예요. 숫자를 크기로 비교하니까, 더 늦은 일의 fence가 보이면 그 앞의 일들도 끝났다는 걸 한 번에 알 수 있어요.</p>
+
+<p>그런데 GPU 안에서는 다른 함정이 있어요. CP는 dispatch 패킷을 읽고 wave를 내려보낸 뒤 <b>그 wave들이 끝나기를 기다리지 않고</b> 다음 패킷으로 넘어가요. 그래서 커널 B가 커널 A의 결과를 읽어야 한다면 둘 사이에 「앞의 compute가 다 끝날 때까지 멈춰」라는 barrier를 넣어야 해요. OpenCL의 in-order 큐에서는 런타임이 이걸 대신 넣어 주고, Vulkan에서는 앱이 <code>vkCmdPipelineBarrier</code>로 직접 말해야 해요. barrier를 켜고 끄며 비교해 보세요.</p>
+
+<div class="sim" id="sim-fence">
+  <div class="sim-title">시뮬레이터 3 · barrier와 fence</div>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" data-k="barrier" checked> A와 B 사이에 barrier 넣기</label>
+  </div>
+  <div class="lanes">
+    <div class="lane"><div class="lane-name">IB</div><div class="lane-body" data-lane="pkts"></div></div>
+    <div class="lane"><div class="lane-name">CU</div><div class="lane-body" data-lane="cu"></div></div>
+    <div class="lane"><div class="lane-name">A의 결과</div><div class="lane-body" data-lane="out"></div></div>
+    <div class="lane"><div class="lane-name">메모리 · 호스트</div><div class="lane-body" data-lane="host"></div></div>
+  </div>
+  <div class="legend"><span><i style="background:var(--accent)"></i>A의 wave</span><span><i style="background:var(--warn)"></i>B의 wave</span><span><i style="background:var(--ok)"></i>끝남</span></div>
+  <div class="controls">
+    <button data-act="tick" class="primary">한 박자</button>
+    <button data-act="auto">자동</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="say"></div>
+  <div class="log"></div>
+</div>
+
+<div class="note">실제 드라이버의 barrier는 「기다리기」만 하지 않아요. A가 쓴 값이 B에게 보이도록 캐시를 비우거나 무효화하는 패킷(<code>ACQUIRE_MEM</code> 같은 것)도 같이 넣어요. 여기서는 기다리는 쪽만 보여 줘요.</div>
+
+<h2>핵심 정리</h2>
+<div class="summary">
+<ul>
+<li><code>clEnqueueNDRangeKernel</code>은 상자를 벨트에 올리는 일이고, GPU에 닿는 건 제출(<code>clFlush</code> 등)과 doorbell 뒤예요.</li>
+<li>UMD는 커널 실행을 <b>PM4 패킷(IB)</b>으로 적어요. <code>SET_SH_REG</code>로 레지스터를 채우고 <code>DISPATCH_DIRECT</code>로 출발시켜요.</li>
+<li>KMD는 링에 <code>INDIRECT_BUFFER</code>(IB를 가리킴)와 <code>RELEASE_MEM</code>(fence)을 쓰고 doorbell에 wptr을 알려요.</li>
+<li>CP(MEC)는 링 → IB 순서로 패킷을 읽어요. 디스패처는 workgroup을 wave로 나눠 <b>자원이 남은 CU</b>에 앉혀요. 한 workgroup은 한 CU에 모여요.</li>
+<li>fence는 계속 커지는 숫자예요. GPU가 끝에서 쓰고 호스트는 「N 이상인가」로 기다려요. GPU 안의 순서는 barrier가 따로 지켜요.</li>
+</ul>
+</div>
+
+<h2>확인 퀴즈</h2>
+<div id="quiz"></div>
+
+<h2>여기까지가 사실, 여기부터가 단순화</h2>
+<p><b>공개 자료로 확인되는 것.</b> PM4 type-3 패킷의 이름과 역할(<code>SET_SH_REG</code>, <code>DISPATCH_DIRECT</code>, <code>INDIRECT_BUFFER</code>, <code>RELEASE_MEM</code>)은 Mesa의 <code>src/amd/common/sid.h</code>와 radv·radeonsi 소스, 리눅스 <code>drivers/gpu/drm/amd/amdgpu</code>(예: <code>gfx_v9_0.c</code>의 compute ring <code>emit_ib</code>·<code>emit_fence</code>, ring의 doorbell <code>set_wptr</code>)에서 볼 수 있어요. 한 workgroup이 한 CU(RDNA의 WGP 모드에선 WGP)에 모인다는 건 AMD의 GCN·RDNA ISA 문서에 나와요.</p>
+<p><b>보기 쉽게 줄인 것.</b> CU 수·CU당 자리·wave가 도는 박자 수는 장난감 값이에요. 실제 CP에는 MEC 안에 여러 pipe와 queue가 있고, 하드웨어 스케줄러가 큐를 하드웨어 슬롯(HQD)에 올리고 내리는 층도 있는데 여기서는 큐 하나만 그렸어요. 링에 무엇을 몇 개 쓰는지는 커널 버전과 GPU 세대마다 조금씩 달라요.</p>
+
+<footer>
+<p>1판 · 2026-10-15 · 초안 — 재희가 사실을 확인하기 전이에요.</p>
+</footer>
+
+</main>
+<script src="../assets/ch01.js"></script>
+</body>
+</html>
