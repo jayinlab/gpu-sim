@@ -5,22 +5,28 @@
 
 const W = 120, H = 48;
 const NODES = [
-  { id: 'app',      x: 20,  y: 36,  t: '앱 · API',          s: 'OpenCL · Vulkan' },
-  { id: 'runtime',  x: 160, y: 36,  t: '런타임 · UMD',      s: '이 경로에선 PM4 생성' },
-  { id: 'wait',     x: 300, y: 36,  t: '완료 대기',          s: 'clFinish · event' },
-  { id: 'ib',       x: 20,  y: 126, t: 'IB',                s: 'PM4 패킷 묶음' },
-  { id: 'kmd',      x: 160, y: 126, t: 'KMD',               s: 'amdgpu · 제출' },
-  { id: 'ring',     x: 20,  y: 250, t: '링 버퍼',            s: 'rptr · wptr' },
-  { id: 'doorbell', x: 160, y: 250, t: 'Doorbell',          s: '새 wptr 알림' },
-  { id: 'cp',       x: 90,  y: 362, t: 'CP · MEC',          s: '패킷 해석' },
-  { id: 'fence',    x: 300, y: 362, t: 'Fence',             s: 'RELEASE_MEM' },
-  { id: 'disp',     x: 90,  y: 452, t: '디스패처',            s: 'workgroup → wave' },
-  { id: 'cache',    x: 300, y: 452, t: '캐시 · 메모리',       s: '가시성 · 동기화' },
-  { id: 'cu',       x: 90,  y: 542, t: 'CU',                s: 'wave 실행' },
-  { id: 'regs',     x: 300, y: 542, t: 'VGPR·SGPR·LDS', s: 'wave 레지스터 · WG LDS' },
+  { id: 'app',      x: 20,  y: 36,  t: '앱',               s: 'OpenCL API' },
+  { id: 'angle',    x: 160, y: 36,  t: 'ANGLE · CL',       s: 'OpenCL → Vulkan' },
+  { id: 'vk',       x: 300, y: 36,  t: 'Vulkan API',       s: '기록 · 제출' },
+  { id: 'wait',     x: 440, y: 36,  t: '완료 대기',          s: 'clFinish · event' },
+  { id: 'clspv',    x: 20,  y: 126, t: 'clspv',            s: 'OpenCL C → SPIR-V' },
+  { id: 'compiler', x: 160, y: 126, t: 'UMD 컴파일러',       s: 'SPIR-V → ISA' },
+  { id: 'umd',      x: 300, y: 126, t: 'UMD 명령 기록',      s: 'PM4 → IB' },
+  { id: 'ib',       x: 160, y: 216, t: 'IB',               s: 'PM4 패킷 묶음' },
+  { id: 'kmd',      x: 300, y: 216, t: 'KMD',              s: 'amdgpu · 제출' },
+  { id: 'ring',     x: 160, y: 330, t: '링 버퍼',           s: 'rptr · wptr' },
+  { id: 'doorbell', x: 300, y: 330, t: 'Doorbell',         s: '새 wptr 알림' },
+  { id: 'cp',       x: 230, y: 446, t: 'CP · MEC',         s: '패킷 해석' },
+  { id: 'fence',    x: 440, y: 446, t: 'Fence',            s: 'GFX9: RELEASE_MEM' },
+  { id: 'disp',     x: 230, y: 536, t: '디스패처',           s: 'workgroup → wave' },
+  { id: 'cache',    x: 20,  y: 626, t: '캐시 · 메모리',      s: '가시성 · 동기화' },
+  { id: 'cu',       x: 230, y: 626, t: 'CU',               s: 'wave 실행' },
+  { id: 'regs',     x: 440, y: 626, t: 'VGPR·SGPR·LDS',    s: 'wave 레지스터 · WG LDS' },
 ];
 const EDGES = [
-  ['app', 'runtime'], ['runtime', 'ib'], ['runtime', 'kmd'],
+  ['app', 'angle'], ['angle', 'vk'], ['vk', 'umd'],
+  ['angle', 'clspv', 'code'], ['clspv', 'compiler', 'code'],
+  ['umd', 'ib'], ['umd', 'kmd'],
   ['kmd', 'ring'], ['kmd', 'doorbell'],
   ['ring', 'ib', 'jump'],
   ['ring', 'cp'], ['doorbell', 'cp'],
@@ -29,9 +35,9 @@ const EDGES = [
   ['fence', 'wait', 'back'],
 ];
 const BANDS = [
-  { t: '호스트 (CPU)', y: 8,   h: 184 },
-  { t: '경계',         y: 216, h: 104 },
-  { t: 'GPU',          y: 336, h: 274 },
+  { t: '호스트 (CPU)', y: 8,   h: 278 },
+  { t: '경계',         y: 300, h: 104 },
+  { t: 'GPU',          y: 420, h: 290 },
 ];
 
 // main = 주로 다룬 칸, touch = 스쳐 간 칸, at = 칸을 누르면 갈 절
@@ -40,16 +46,16 @@ const CHAPTERS = [
     id: 'ch01', no: '01', status: 'published', color: 'var(--c1)',
     title: '커맨드가 Queue를 거쳐 CU에 닿기까지', href: 'ch01/',
     main: ['ib', 'kmd', 'ring', 'doorbell', 'cp', 'fence', 'cu'],
-    touch: ['app', 'runtime', 'wait', 'disp', 'cache', 'regs'],
-    at: { app: 's1', runtime: 's1', kmd: 's1', ring: 's2', doorbell: 's2', ib: 's3', cp: 's3',
+    touch: ['app', 'umd', 'wait', 'disp', 'cache', 'regs'],
+    at: { app: 's1', umd: 's1', kmd: 's1', ring: 's2', doorbell: 's2', ib: 's3', cp: 's3',
           disp: 's4', cu: 's4', regs: 's4', fence: 's5', wait: 's5', cache: 's5' },
   },
   {
-    id: 'ch02', no: '02', status: 'planned', color: 'var(--c2)',
-    title: 'Queue — 넣기·보내기·알리기는 다른 시점', href: null,
-    main: ['app', 'runtime', 'kmd', 'ring', 'doorbell'],
-    touch: ['wait', 'ib'],
-    at: {},
+    id: 'ch02', no: '02', status: 'published', color: 'var(--c2)',
+    title: 'Queue — 넣기·보내기·알리기는 다른 시점', href: 'ch02/',
+    main: ['app', 'angle', 'vk', 'umd', 'kmd'],
+    touch: ['wait', 'ib', 'ring', 'doorbell'],
+    at: { app: 's1', angle: 's2', vk: 's2', umd: 's2', kmd: 's2', ib: 's2', ring: 's2', doorbell: 's2', wait: 's3' },
   },
 ];
 
@@ -62,30 +68,36 @@ const mk = (tag, attrs, parent) => {
   return e;
 };
 
-// 중심끼리 이은 선을 두 상자 테두리에서 자른다
-function clip(a, b) {
-  const ax = a.x + W / 2, ay = a.y + H / 2, bx = b.x + W / 2, by = b.y + H / 2;
-  const dx = bx - ax, dy = by - ay;
-  const f = (hw, hh) => Math.min(dx ? hw / Math.abs(dx) : Infinity, dy ? hh / Math.abs(dy) : Infinity);
-  const t = f(W / 2 + 3, H / 2 + 3);
-  return [ax + dx * t, ay + dy * t, bx - dx * t, by - dy * t];
+// 상자 중심에서 (tx, ty) 쪽으로 나가는 선이 테두리와 만나는 점
+function exit(n, tx, ty) {
+  const cx = n.x + W / 2, cy = n.y + H / 2, dx = tx - cx, dy = ty - cy;
+  const t = Math.min(dx ? (W / 2 + 3) / Math.abs(dx) : Infinity, dy ? (H / 2 + 3) / Math.abs(dy) : Infinity);
+  return [cx + dx * t, cy + dy * t];
 }
+const center = n => [n.x + W / 2, n.y + H / 2];
 
 function draw(svg) {
-  svg.setAttribute('viewBox', '0 0 440 620');
+  svg.setAttribute('viewBox', '0 0 580 720');
   svg.setAttribute('class', 'gmap');
   const defs = mk('defs', {}, svg);
   const m = mk('marker', { id: svg.id + '-arw', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' }, defs);
   mk('path', { d: 'M0,0 L10,5 L0,10 z', class: 'gmap-arw' }, m);
 
   BANDS.forEach(b => {
-    mk('rect', { x: 4, y: b.y, width: 432, height: b.h, rx: 14, class: 'gmap-band' }, svg);
+    mk('rect', { x: 4, y: b.y, width: 572, height: b.h, rx: 14, class: 'gmap-band' }, svg);
     mk('text', { x: 16, y: b.y + 18, class: 'gmap-band-t' }, svg).textContent = b.t;
   });
+  // 컴파일러와 명령 기록은 둘 다 Vulkan 드라이버(UMD) 안의 일이라 한 테두리로 묶는다
+  mk('rect', { x: 151, y: 118, width: 278, height: 72, rx: 13, class: 'gmap-group' }, svg);
+  mk('text', { x: 290, y: 114, class: 'gmap-group-t' }, svg).textContent = 'Vulkan 드라이버';
 
-  EDGES.forEach(([f, t, kind]) => {
-    const [x1, y1, x2, y2] = clip(node(f), node(t));
-    mk('line', { x1, y1, x2, y2, class: 'gmap-edge' + (kind ? ' ' + kind : ''), 'marker-end': 'url(#' + svg.id + '-arw)', 'data-f': f, 'data-t': t }, svg);
+  // 노드 상자는 y+6에 그려지므로 선도 6 내려 그린다
+  EDGES.forEach(([f, t, kind, via]) => {
+    const a = node(f), b = node(t);
+    const [ax, ay] = via ? exit(a, via[0], via[1]) : exit(a, ...center(b));
+    const [bx, by] = via ? exit(b, via[0], via[1]) : exit(b, ...center(a));
+    const d = via ? `M${ax},${ay + 6} Q${via[0]},${via[1] + 6} ${bx},${by + 6}` : `M${ax},${ay + 6} L${bx},${by + 6}`;
+    mk('path', { d, fill: 'none', class: 'gmap-edge' + (kind ? ' ' + kind : ''), 'marker-end': 'url(#' + svg.id + '-arw)', 'data-f': f, 'data-t': t }, svg);
   });
 
   const g = {};
@@ -97,12 +109,11 @@ function draw(svg) {
     g[n.id] = a;
   });
   // 점선 두 개는 뜻을 칸 옆에 적는다
-  mk('text', { x: 86, y: 224, class: 'gmap-elabel' }, svg).textContent = 'IB를 따라감';
-  mk('text', { x: 366, y: 240, class: 'gmap-elabel' }, svg).textContent = '완료 관찰';
-  // 노드 좌표의 y는 상자 위쪽 여백 6을 뺀 값이라 선 계산과 맞춘다
-  svg.querySelectorAll('line').forEach(l => {
-    ['y1', 'y2'].forEach(k => l.setAttribute(k, +l.getAttribute(k) + 6));
-  });
+  mk('text', { x: 226, y: 298, class: 'gmap-elabel' }, svg).textContent = 'IB를 따라감';
+  mk('text', { x: 506, y: 300, class: 'gmap-elabel' }, svg).textContent = '완료 관찰';
+  mk('text', { x: 24, y: 124, class: 'gmap-elabel' }, svg).textContent = 'compile chain';
+  mk('text', { x: 286, y: 214, class: 'gmap-elabel' }, svg).textContent = '기록';
+  mk('text', { x: 366, y: 214, class: 'gmap-elabel' }, svg).textContent = '제출';
   return g;
 }
 

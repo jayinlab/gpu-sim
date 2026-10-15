@@ -183,14 +183,17 @@ input[type=number], select {
 footer { margin-top: 64px; font-size: .82rem; color: var(--ink-2); }
 
 /* 탐색 지도 */
-.gmap-box { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 20px; align-items: start; margin: 1.6em 0 2.4em; }
+.gmap-box { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 20px; align-items: start; margin: 1.6em 0 2.4em; }
 .gmap-wrap { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 10px; }
 .gmap { width: 100%; height: auto; display: block; }
 .gmap-band { fill: var(--surface-2); opacity: .55; }
 .gmap-band-t { font-size: 11px; font-weight: 700; letter-spacing: .06em; fill: var(--ink-2); }
 .gmap-edge { stroke: var(--line); stroke-width: 1.6; transition: stroke .25s, opacity .25s; }
-.gmap-edge.jump, .gmap-edge.back { stroke-dasharray: 4 4; }
+.gmap-edge.jump, .gmap-edge.back { stroke-dasharray: 3 4; }
+.gmap-edge.code { stroke-dasharray: 9 4; }
 .gmap-edge.lit { stroke: var(--cc); stroke-width: 2.2; }
+.gmap-group { fill: none; stroke: var(--ink-2); stroke-width: 1; stroke-dasharray: 5 4; opacity: .7; }
+.gmap-group-t { font-size: 10.5px; font-weight: 700; fill: var(--ink-2); text-anchor: middle; }
 .gmap-elabel { font-size: 10px; fill: var(--ink-2); font-style: italic; }
 .gmap-arw { fill: var(--ink-2); opacity: .55; }
 .gmap-node rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.3; transition: fill .25s, stroke .25s, opacity .25s; }
@@ -222,15 +225,48 @@ footer { margin-top: 64px; font-size: .82rem; color: var(--ink-2); }
 .gmap-legend i.m { background: var(--c1); }
 .gmap-legend i.t { background: color-mix(in srgb, var(--c1) 12%, var(--surface)); }
 .gmap-legend i.e { border-style: dashed; border-color: var(--ink-2); }
-.chapter-map { max-width: 400px; margin: 1.4em auto 0; }
+.chapter-map { max-width: 520px; margin: 1.4em auto 0; }
 .chapter-map .gmap-wrap { padding: 6px; }
 .chapter-map figcaption { font-size: .82rem; color: var(--ink-2); text-align: center; margin-top: 6px; }
-main.wide { max-width: 980px; }
+main.wide { max-width: 1120px; }
+
+
+/* 표 */
+.tbl { width: 100%; border-collapse: collapse; font-size: .9rem; margin: 1em 0 1.4em; display: block; overflow-x: auto; }
+.tbl th, .tbl td { border-bottom: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+.tbl th { font-size: .8rem; color: var(--ink-2); font-weight: 700; }
+
+/* 2장 · 정거장 */
+.stations { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
+.station { border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); padding: 6px; min-height: 110px; }
+.station-name { font-size: .7rem; font-weight: 700; color: var(--ink-2); margin-bottom: 6px; line-height: 1.3; }
+.station-body { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; }
+.batch { border: 1px dashed var(--accent); border-radius: 6px; padding: 4px; display: flex; flex-wrap: wrap; gap: 3px; }
+.batch-name { width: 100%; font-size: .66rem; color: var(--accent); font-family: var(--mono); }
+.chip.run { border-color: var(--warn); background: var(--warn-soft); }
+.hostline { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
+.twoq { display: grid; gap: 8px; }
+.qlane { display: grid; grid-template-columns: 70px 1fr; gap: 10px; align-items: center; }
+.qname { font-size: .8rem; font-weight: 700; color: var(--ink-2); }
+.muted { color: var(--ink-2); font-size: .85rem; }
+
+/* 2장 · 타임라인 */
+.tl { margin-top: 10px; }
+.tl-row { display: grid; grid-template-columns: 56px 1fr; gap: 8px; align-items: center; margin: 6px 0; }
+.tl-name { font-size: .8rem; font-weight: 700; color: var(--ink-2); }
+.tl-track { position: relative; height: 30px; background: var(--surface-2); border-radius: 6px; overflow: hidden; }
+.tl-seg { position: absolute; top: 3px; bottom: 3px; border-radius: 4px; font-size: .66rem; color: var(--ink); display: flex; align-items: center; justify-content: center; overflow: hidden; white-space: nowrap; box-shadow: inset 0 0 0 1px var(--surface); }
+.tl-seg.enq { background: var(--surface); border: 1px solid var(--line); }
+.tl-seg.sub { background: var(--bad-soft); border: 1px solid var(--bad); }
+.tl-seg.run { background: var(--accent-soft); border: 1px solid var(--accent); }
+.tl-cmp { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.gmap-box > div:last-child { position: sticky; top: 16px; }
 
 @media (max-width: 760px) {
   .gmap-box { grid-template-columns: 1fr; }
 }
 @media (max-width: 560px) {
+  .stations { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .ring, .ptrs { grid-template-columns: repeat(4, 1fr); }
   .lane { grid-template-columns: 1fr; gap: 2px; }
   .lane-name { padding-top: 0; }

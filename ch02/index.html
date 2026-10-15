@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2장 · Queue</title>
+<meta name="description" content="clEnqueue·clFlush·doorbell은 서로 다른 시점이다. 층마다 있는 대기열을 OpenCL 이벤트 네 상태로 따라가는 장.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+
+<p class="crumb"><a href="../">GPU Sim</a> · 2장</p>
+<h1>Queue — 넣기·보내기·알리기는 다른 시점</h1>
+<p class="lead"><code>clEnqueueNDRangeKernel</code>이 돌아온 순간, 그 커널은 어디에 있을까요? 「큐」라는 말은 하나지만 실제로는 층마다 대기열이 하나씩 있어요. 이 장은 명령 하나가 그 대기열들을 차례로 건너는 걸 따라가요.</p>
+
+<div class="note">이 장의 경로는 <b>OpenCL을 Vulkan 위에서 돌리는 구현(ANGLE 등) → AMD Vulkan 드라이버 → 리눅스 amdgpu</b>예요. 층과 층 사이의 언제·얼마나는 구현마다 달라요. 사양이 정한 것과 구현의 예를 글 끝에 나눠 적었어요.</div>
+
+<figure class="chapter-map" data-gmap="ch02">
+  <div class="gmap-wrap"></div>
+  <figcaption>이 장이 지나가는 길. 진한 칸이 주로 다루는 곳이고, 칸을 누르면 그 절로 가요. <a href="../">전체 지도</a></figcaption>
+</figure>
+
+<h2 id="s1">1. 큐는 줄이 아니라 약속이에요</h2>
+
+<p>OpenCL의 command queue는 「넣은 순서대로 실행된 것처럼 보이게 해 줄게」라는 약속이에요(in-order 큐 기준). 약속이지 컨베이어 벨트 자체는 아니에요. <code>clEnqueue…</code>는 명령을 약속 목록 끝에 적고 곧바로 돌아와요. 그 명령이 지금 어디쯤인지는 <b>event</b>가 알려 줘요. 사양은 명령의 상태를 넷으로 나눠요.</p>
+
+<table class="tbl">
+<thead><tr><th>상태</th><th>사양의 뜻</th><th>이 경로의 예 (사양 정의가 아님)</th></tr></thead>
+<tbody>
+<tr><td><code>CL_QUEUED</code></td><td>명령이 큐에 들어감</td><td>ANGLE이 받아 Vulkan 명령으로 기록해 둔 상태</td></tr>
+<tr><td><code>CL_SUBMITTED</code></td><td>호스트가 명령을 디바이스로 제출함</td><td><code>vkQueueSubmit</code>으로 넘어간 뒤</td></tr>
+<tr><td><code>CL_RUNNING</code></td><td>디바이스가 실행을 시작함</td><td>GPU가 그 커널을 돌리는 중</td></tr>
+<tr><td><code>CL_COMPLETE</code></td><td>명령이 성공적으로 끝남</td><td>그 제출의 완료가 기록된 뒤</td></tr>
+</tbody>
+</table>
+
+<p>사양은 SUBMITTED를 「호스트가 디바이스에 제출한 상태」로 정의하지만, 내부의 어느 경계인지는 정하지 않아요. 실제 ANGLE은 자기 기록을 내부 command buffer로 옮긴 뒤 SUBMITTED로 바꿔요. 이 장의 시뮬레이터는 제출 호출 부근에 표시할 뿐이에요. 명령이 실패하면 음수 상태로 끝날 수도 있어요.</p>
+
+<h2 id="s2">2. 층마다 대기열이 하나씩</h2>
+
+<p>명령은 GPU에 닿기까지 대기와 제출의 단계 넷을 건너요. 단계마다 넣는 호출이 있고, 다음으로 넘기는 때가 따로 있어요. 넣는 때와 넘기는 때가 어긋나는 곳마다 「시점」이 하나씩 갈라져요.</p>
+
+<table class="tbl">
+<thead><tr><th>단계</th><th>무엇이 있나</th><th>넣는 호출</th><th>다음으로 넘기는 때</th></tr></thead>
+<tbody>
+<tr><td>OpenCL 큐 (ANGLE)</td><td>Vulkan 명령으로 옮겨 적은 기록 (<code>vkCmdBindPipeline</code>, <code>vkCmdBindDescriptorSets</code>, <code>vkCmdPushConstants</code>, <code>vkCmdDispatch</code> 등)</td><td><code>clEnqueue…</code></td><td>구현이 제출하기로 정한 때 (<code>clFlush</code>, 막는 호출, 구현의 판단)</td></tr>
+<tr><td>Vulkan 제출</td><td>기록을 마친 command buffer</td><td><code>vkQueueSubmit</code>으로 큐에 제출</td><td>UMD가 곧 KMD 제출로 이어 감</td></tr>
+<tr><td>KMD 스케줄러</td><td>job: 실행할 IB 목록과 의존성</td><td>amdgpu 제출 ioctl</td><td>DRM GPU 스케줄러가 실행 가능하다고 보면 IB 제출 경로로 넘기고, 그때 링에 패킷을 써요(조건은 단순화)</td></tr>
+<tr><td>링 (1장)</td><td><code>INDIRECT_BUFFER</code>와 fence 패킷</td><td>KMD</td><td>doorbell 뒤 CP가 읽을 때</td></tr>
+</tbody>
+</table>
+
+<div class="note fact"><b>PM4는 언제 적힐까?</b> radv(Mesa의 AMD Vulkan 드라이버)는 <code>vkCmdDispatch</code>를 <b>기록하는 과정에서</b> command buffer의 PM4 스트림에 dispatch 패킷을 적어요. <code>vkQueueSubmit</code>은 이미 적힌 IB를 커널에 넘기는 일이에요. 그러니 「보내기」 전에 PM4가 이미 메모리에 있을 수 있어요. 다만 ANGLE이 <code>vkCmd…</code>를 enqueue 그 자리에서 부르는지, 자기 기록을 모았다가 제출 때 옮기는지는 구현 세부라서, 이 장은 「기록해 둔다」까지만 말해요.</div>
+
+<p>아래에서 커널을 몇 개 넣고 시간을 흘려 보세요. 이 모델에서는 제출 전에 아무리 기다려도 GPU가 움직이지 않아요.</p>
+
+<div class="sim" id="sim-layers">
+  <div class="sim-title">시뮬레이터 1 · 층마다 대기열</div>
+  <div class="stations"></div>
+  <div class="hostline"></div>
+  <div class="controls">
+    <button data-act="enq" class="primary">clEnqueueNDRangeKernel</button>
+    <button data-act="flush">clFlush</button>
+    <button data-act="finish">clFinish</button>
+    <button data-act="tick">시간 한 박자</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" data-k="auto"> 런타임이 알아서 보내기 (구현에 따라)</label>
+  </div>
+  <div class="say"></div>
+  <div class="log"></div>
+</div>
+
+<div class="note">이 그림은 flush를 부를 때 SUBMITTED로, 묶음의 마지막 완료 때 모두 COMPLETE로 옮기는 장난감 상태 기계예요. 실제 event 상태가 바뀌는 시점과 완료를 얼마나 촘촘히 추적하는지는 구현마다 달라요.</div>
+
+<h2 id="s3">3. clFlush와 clFinish가 약속하는 것</h2>
+
+<p>두 호출은 이름이 비슷하지만 약속의 크기가 달라요.</p>
+
+<ul>
+<li><b><code>clFlush</code></b> — 앞서 넣은 명령들을 디바이스로 내보내라는 신호예요. 사양이 보장하는 건 <b>「그 명령들이 언젠가 디바이스에 제출된다」</b>까지예요. 끝나기를 기다리지 않고, 돌아온 순간 이미 doorbell이 울렸다는 보장도 없어요.</li>
+<li><b><code>clFinish</code></b> — 앞서 넣은 명령이 모두 제출되고 <b>끝날 때까지</b> 호출한 스레드를 막아요. 그래서 그 안에 flush가 들어 있는 셈이에요.</li>
+<li><b>막는 호출</b> — 결과를 바로 돌려줘야 하는 호출(예: blocking 모드의 <code>clEnqueueReadBuffer</code>)과 <code>clReleaseCommandQueue</code>는 암묵적으로 flush해요.</li>
+</ul>
+
+<p>구현은 flush가 없어도 알아서 보낼 수 있어요. 하지만 그건 구현의 친절이지 약속이 아니에요. 그 차이가 드러나는 곳이 <b>큐가 둘일 때</b>예요. 사양은 「다른 큐의 명령이 이 큐의 event를 기다리게 하려면, 앱이 이 큐를 <code>clFlush</code>하거나 암묵 flush를 하는 호출을 불러야 한다」고 적어 둬요. 안 하면 어떻게 되는지 보세요.</p>
+
+<div class="sim" id="sim-two">
+  <div class="sim-title">시뮬레이터 2 · flush를 잊은 두 큐</div>
+  <div class="twoq"></div>
+  <div class="controls">
+    <button data-act="a">큐 A: k1 넣기</button>
+    <button data-act="b">큐 B: k2 넣기 (k1의 event를 기다림)</button>
+    <button data-act="flushA">clFlush(A)</button>
+    <button data-act="finishB" class="primary">clFinish(B)</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="say"></div>
+</div>
+
+<div class="note">이건 <b>A를 자동으로 제출하지 않는 가상의 런타임</b>과 호스트 스레드 하나에서 생길 수 있는 교착 모델이에요. 실제 ANGLE은 큐끼리의 의존성을 처리하면서 A를 스스로 제출하기도 해요. 그러니 이건 ANGLE에서 관찰되는 교착이 아니에요. 다만 사양이 보장하지 않는 친절에 기대면 다른 구현에서 멈출 수 있으니, 이식성 있는 OpenCL 코드는 A를 flush해야 해요.</div>
+
+<h2 id="s4">4. 얼마나 자주 보낼까</h2>
+
+<p>그럼 매번 flush하면 안전하고 좋을까요? 제출에는 비용이 있어요. <code>vkQueueSubmit</code>, 커널 진입, 스케줄러, doorbell까지 호스트가 매번 치르는 고정비예요. 너무 자주 보내면 CPU가 제출에 시간을 쓰고 GPU는 조각조각 일해요. 너무 모아서 보내면 GPU가 처음부터 오래 놀아요. 커널 12개를 몇 개씩 묶어 보낼지 바꿔 보세요.</p>
+
+<div class="sim" id="sim-batch">
+  <div class="sim-title">시뮬레이터 3 · 묶음 크기와 비용 (장난감 단위)</div>
+  <div class="controls">
+    <label class="inline">몇 개마다 flush <select data-k="k"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>6</option><option>12</option></select></label>
+    <label class="inline">제출 한 번 비용 <select data-k="sub"><option>2</option><option selected>4</option><option>8</option></select></label>
+    <label class="inline">커널 하나 GPU 시간 <select data-k="run"><option>1</option><option selected>3</option><option>6</option></select></label>
+  </div>
+  <div class="tl"></div>
+  <div class="say"></div>
+</div>
+
+<p>최적점은 비용의 비율로 정해져요. 커널이 아주 짧을수록(tiny dispatch) 제출 고정비가 전체를 지배해요. 그때 손볼 곳은 커널이 아니라 제출 횟수와 동기화 패턴이에요.</p>
+
+<h2>핵심 정리</h2>
+<div class="summary">
+<ul>
+<li>OpenCL 큐는 순서의 <b>약속</b>이에요. <code>clEnqueue…</code>는 적고 돌아오고, 명령이 어디쯤인지는 event 상태(QUEUED → SUBMITTED → RUNNING → COMPLETE)가 알려 줘요.</li>
+<li>대기와 제출의 단계가 층마다 있어요. ANGLE의 기록, Vulkan 제출, KMD 스케줄러, 링. 넣는 때와 넘기는 때가 어긋나는 곳마다 시점이 갈라져요.</li>
+<li>radv는 기록하는 과정에서 PM4를 적어요. 제출은 이미 적힌 IB를 넘기는 일이에요.</li>
+<li><code>clFlush</code>는 「언젠가 제출된다」, <code>clFinish</code>는 「끝날 때까지 기다린다」예요. 다른 큐가 이 큐의 event를 기다리면 이 큐를 <code>clFlush</code>하거나 암묵 flush를 하는 호출을 불러야 해요.</li>
+<li>제출은 공짜가 아니에요. 너무 잦으면 CPU 고정비가, 너무 드물면 GPU의 빈 시간이 커져요.</li>
+</ul>
+</div>
+
+<h2>확인 퀴즈</h2>
+<div id="quiz"></div>
+
+<h2>더 읽기</h2>
+<p>블로그에서 이 장의 대기열을 더 깊게 다룬 글이에요.</p>
+<ul>
+<li><a href="https://jayinlab.github.io/opencl-note-clflush-vs-clfinish/">clFlush와 clFinish를 언제 나눠 써야 하는가</a> — 3절의 두 약속</li>
+<li><a href="https://jayinlab.github.io/opencl-note-angle-map/">ANGLE 분리 지도 — compile chain vs submit chain</a> — 지도의 실선과 긴 점선</li>
+<li><a href="https://jayinlab.github.io/opencl-note-small-dispatch-submit-overhead/">Tiny Dispatch에서 진짜 병목: GPU 연산보다 Submit 경로</a> — 4절의 비용</li>
+<li><a href="https://jayinlab.github.io/opencl-note-ring-doorbell-submit-boundary/">ring buffer와 doorbell: submit이 GPU 실행으로 바뀌는 경계</a> — 마지막 대기열</li>
+</ul>
+
+<h2>여기까지가 사실, 여기부터가 단순화</h2>
+<p><b>사양이 정한 것.</b> event의 네 상태, <code>clFlush</code>가 「언젠가 제출」만 보장한다는 것, <code>clFinish</code>가 완료까지 막는다는 것, 막는 호출과 <code>clReleaseCommandQueue</code>의 암묵 flush, 다른 큐의 event를 기다릴 때 flush가 필요하다는 규칙은 Khronos OpenCL 사양의 command-queue·event 절을 따랐어요.</p>
+<p><b>구현의 예.</b> radv가 기록 호출 때 PM4를 적는다는 건 Mesa <code>src/amd/vulkan</code>(<code>radv_cmd_buffer.c</code>)에서, amdgpu가 job을 GPU 스케줄러에 넣었다가 링에 쓴다는 건 리눅스 <code>drivers/gpu/drm/amd/amdgpu/amdgpu_job.c</code>와 <code>drivers/gpu/drm/scheduler</code>에서 볼 수 있어요. ANGLE의 OpenCL Vulkan 백엔드가 clspv로 커널을 SPIR-V로 바꾸고 Vulkan 명령으로 실행한다는 건 ANGLE 소스(<code>src/libANGLE/renderer/vulkan/</code>의 <code>CL…Vk</code> 파일들)를 따랐어요.</p>
+<p><b>모델의 가정.</b> SUBMITTED를 제출 호출 부근으로 잡았어요(실제 ANGLE의 경계는 다를 수 있어요). 시뮬레이터 2는 자동 제출이 없는 가상의 런타임이에요. 한 번의 제출을 묶음 하나로 보고, 묶음의 fence가 써질 때 묶음 안 명령이 함께 COMPLETE가 된다고 그렸어요(구현은 더 촘촘히 알릴 수도 있어요). 「알아서 보내기」 규칙, 모든 비용과 박자는 장난감 값이에요.</p>
+
+<footer>
+<p>1판 · 2026-10-15 · Claude가 쓰고 OCL(GPT)이 사실 검토한 글이에요. 틀린 곳을 찾으면 리포 이슈로 알려 주세요.</p>
+</footer>
+
+</main>
+<script src="../assets/map.js"></script>
+<script src="../assets/ch02.js"></script>
+</body>
+</html>

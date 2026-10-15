@@ -20,7 +20,7 @@
       <span><i class="t"></i>스쳐 간 칸</span>
       <span><i class="e"></i>아직 빈 땅</span>
     </div>
-    <p class="gmap-note">실선은 명령이 흘러가는 길이에요. 점선 「IB를 따라감」은 CP가 링의 <code>INDIRECT_BUFFER</code> 패킷을 읽고 IB로 건너가는 것, 「완료 관찰」은 호스트가 fence를 보고 대기를 푸는 거예요. 세 띠는 물리적인 자리가 아니라 역할 구분이에요. 링은 GPU가 읽는 메모리 속 큐이고, doorbell은 제출을 알리는 창구예요.</p>
+    <p class="gmap-note">실선은 명령이 흘러가는 길(submit chain), 긴 점선은 프로그램 빌드 길(compile chain)이에요: ANGLE이 clspv로 SPIR-V를 만들고, Vulkan 드라이버가 파이프라인을 만들며 안의 컴파일러로 ISA를 만들어요. 점선 테두리 「Vulkan 드라이버」는 컴파일러와 명령 기록이 둘 다 드라이버(UMD) 안의 일이라는 표시예요. 명령 기록에서 IB로 가는 선은 기록, KMD로 가는 선은 제출이에요. 점선 「IB를 따라감」은 CP가 링의 <code>INDIRECT_BUFFER</code> 패킷을 읽고 IB로 건너가는 것, 「완료 관찰」은 호스트가 fence를 보고 대기를 푸는 거예요. 세 띠는 물리적인 자리가 아니라 역할 구분이에요. 링은 GPU가 읽는 메모리 속 큐이고, doorbell은 제출을 알리는 창구예요.</p>
   </div>
   <div>
     <ul class="gmap-chapters"></ul>
