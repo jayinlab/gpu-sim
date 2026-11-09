@@ -57,6 +57,13 @@ const CHAPTERS = [
     touch: ['wait', 'ib', 'ring', 'doorbell'],
     at: { app: 's1', angle: 's2', vk: 's2', umd: 's2', kmd: 's2', ib: 's2', ring: 's2', doorbell: 's2', wait: 's3' },
   },
+  {
+    id: 'ch03', no: '03', status: 'published', color: 'var(--c3)',
+    title: '디스패처 — 패킷 하나가 wave 수천 개로', href: 'ch03/',
+    main: ['disp', 'cu', 'regs'],
+    touch: ['cp', 'umd', 'vk'],
+    at: { vk: 's1', umd: 's1', cp: 's1', disp: 's2', cu: 's2', regs: 's3' },
+  },
 ];
 
 const NS = 'http://www.w3.org/2000/svg';

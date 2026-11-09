@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3장 · 디스패처</title>
+<meta name="description" content="DISPATCH_DIRECT 한 패킷이 workgroup 수천 개가 되어 CU 수십 개에 깔리고, wave가 첫 레지스터를 받고 깨어나기까지.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+
+<p class="crumb"><a href="../">GPU Sim</a> · 3장</p>
+<h1>디스패처 — 패킷 하나가 wave 수천 개로</h1>
+<p class="lead">CP가 <code>DISPATCH_DIRECT</code>를 읽은 순간 GPU가 받은 건 숫자 몇 개예요. 「workgroup을 x개 만들어라」. 이 장은 그 숫자가 workgroup으로 쪼개져 CU 수십 개에 깔리고, wave 하나하나가 「나는 몇 번째인가」를 레지스터에 받고 깨어나기까지를 따라가요.</p>
+
+<div class="note">이 장의 하드웨어는 <b>AMD GCN·RDNA 계열</b>이고, 레지스터 이름은 Mesa(<code>sid.h</code>)와 리눅스 amdgpu가 쓰는 이름을 따랐어요. workgroup을 어느 CU에 먼저 보내는지 같은 세부는 공개된 정의가 없어서, 시뮬레이터는 단순한 규칙을 가정했어요. 무엇이 사실이고 무엇이 가정인지는 글 끝에 나눠 적었어요.</div>
+
+<figure class="chapter-map" data-gmap="ch03">
+  <div class="gmap-wrap"></div>
+  <figcaption>이 장이 지나가는 길. 진한 칸이 주로 다루는 곳이고, 칸을 누르면 그 절로 가요. <a href="../">전체 지도</a></figcaption>
+</figure>
+
+<h2 id="s1">1. 디스패처가 받는 것은 숫자 몇 개예요</h2>
+
+<p>1장에서 dispatch 하나는 패킷 몇 개로 내려갔어요. 드라이버는 먼저 <code>SET_SH_REG</code>로 레지스터를 채우고, 마지막에 <code>DISPATCH_DIRECT</code>로 「시작」을 알려요. 아래는 디스패처가 읽는 대표적인 레지스터예요. 세대에 따라 <code>COMPUTE_PGM_RSRC3</code>, dispatch initiator, 시작 좌표 같은 설정이 더 있어요.</p>
+
+<table class="tbl">
+<thead><tr><th>레지스터 (필드)</th><th>뜻</th><th>어디서 왔나</th></tr></thead>
+<tbody>
+<tr><td><code>DISPATCH_DIRECT</code>의 x·y·z</td><td>workgroup을 축마다 몇 개 만들지</td><td><code>vkCmdDispatch(x, y, z)</code>의 groupCount</td></tr>
+<tr><td><code>COMPUTE_NUM_THREAD_X/Y/Z</code></td><td>workgroup의 축마다 크기 (전체 work-item 수는 세 값의 곱)</td><td>셰이더의 local size 설정 (OpenCL의 local size)</td></tr>
+<tr><td><code>COMPUTE_PGM_LO/HI</code></td><td>셰이더 기계어의 주소 (필드 모양에 맞춰 인코딩해서 넣음)</td><td>드라이버가 올려 둔 코드 버퍼</td></tr>
+<tr><td><code>COMPUTE_PGM_RSRC1</code> (<code>VGPRS</code>·<code>SGPRS</code>)</td><td>wave 하나의 VGPR 할당량(블록 단위로 인코딩). <code>SGPRS</code>는 GCN에선 SGPR 할당량이지만, RDNA(GFX10 이후)에선 0으로 두고 SGPR은 늘 128개가 잡혀요</td><td>컴파일러가 낸 사용량</td></tr>
+<tr><td><code>COMPUTE_PGM_RSRC2</code> (<code>USER_SGPR</code>·<code>TGID_X_EN</code>·<code>TIDIG_COMP_CNT</code>·<code>LDS_SIZE</code>)</td><td>wave를 띄울 때 미리 넣어 줄 값(user SGPR 수, workgroup 번호를 줄지, local id를 x·xy·xyz 중 몇 성분 줄지), workgroup당 LDS(정해진 단위로 인코딩)</td><td>컴파일러와 드라이버</td></tr>
+<tr><td><code>COMPUTE_USER_DATA_0…</code></td><td>wave의 첫 SGPR에 그대로 복사될 값</td><td>드라이버(디스크립터·인자 주소 등)</td></tr>
+<tr><td><code>COMPUTE_RESOURCE_LIMITS</code>, <code>COMPUTE_STATIC_THREAD_MGMT_SE0…</code></td><td>workgroup·wave 수 한도와 분배 제어, 이 큐가 쓸 수 있는 CU 마스크</td><td>드라이버(기본은 보통 전부 켬)</td></tr>
+</tbody>
+</table>
+
+<p>CP의 compute 프런트엔드가 dispatch를 받아 넘기면(compute 큐에선 MEC가 명령을 처리해요), <b>SPI</b>(Shader Processor Input) 같은 workgroup 관리 하드웨어가 CU나 WGP의 자원을 보고 wave를 배치해요. 일이 어느 블록에서 어디까지인지는 공개 자료로 다 갈리지 않아서, 이 장에서는 이 하드웨어들을 묶어 「디스패처」라고 불러요. 지도의 「디스패처」 칸이에요.</p>
+
+<h2 id="s2">2. 자리가 날 때마다 하나씩 깔아요</h2>
+
+<p>디스패처는 workgroup을 한꺼번에 다 놓지 않아요. CU에 <b>자리가 있으면 놓고, 없으면 기다렸다가 자리가 나면 놓아요</b>. 자리는 두 가지로 정해져요.</p>
+<ul>
+<li><b>한 workgroup은 한 CU에 통째로</b>(RDNA의 WGP 모드에선 한 WGP에) 들어가요. 같은 workgroup의 wave끼리 LDS를 나눠 쓰고 barrier로 서로를 기다려야 하니까요. 그래서 workgroup 전체를 받을 자원이 남아 있어야 앉아요. 다만 모든 wave가 같은 사이클에 시작한다는 뜻은 아니에요. 예외로 gfx90a·gfx942 등의 <code>TG_SPLIT</code> 모드에선 한 workgroup의 wave가 여러 CU에 흩어질 수 있고, 그 대신 LDS와 <code>s_barrier</code>를 못 써요.</li>
+<li><b>CU 하나에 workgroup이 몇 개 앉는지</b>는 그 커널이 쓰는 VGPR·LDS(GCN에선 SGPR도)와 하드웨어 wave 자리 수가 정해요. 블로그 <a href="https://jayinlab.github.io/gpu-occupancy/">Occupancy</a> 글의 계산이 바로 이 숫자를 내요. 아래에선 그 결과를 「CU당 동시 workgroup」 하나로 받아요. 시뮬레이터는 CU 단위 모델이라, WGP 모드라면 WGP 수와 WGP당 수용량으로 바꿔 세야 해요.</li>
+</ul>
+
+<p>「장난감」은 SE 2개에 CU 2개씩, 「큰 GPU」는 SE 4개에 CU 16개씩이에요. 장난감 크기로 먼저 보고, 「큰 GPU」로 바꿔 보세요. CU 64개짜리 GPU에 workgroup 65개를 보내면 무슨 일이 생기는지가 이 장의 첫 장면이에요.</p>
+
+<div class="sim" id="sim-spread">
+  <div class="sim-title">시뮬레이터 1 · workgroup이 CU에 깔리기까지</div>
+  <div class="controls">
+    <label class="inline">GPU <select data-k="gpu"><option value="toy">장난감 2×2</option><option value="big" selected>큰 GPU 4×16</option></select></label>
+    <label class="inline">workgroup 수 <select data-k="n"><option>8</option><option>32</option><option>64</option><option selected>65</option><option>128</option><option>200</option><option>256</option></select></label>
+    <label class="inline">CU당 동시 workgroup <select data-k="k"><option selected>1</option><option>2</option><option>4</option></select></label>
+  </div>
+  <div class="controls">
+    <label class="inline">CU 마스크 <select data-k="mask"><option value="all" selected>전부 켬</option><option value="half">SE마다 절반만</option></select></label>
+    <label class="inline"><input type="checkbox" data-k="vary"> workgroup마다 걸리는 시간이 다름</label>
+  </div>
+  <div class="ses"></div>
+  <div class="util"><div class="util-name">CU 자리 사용률 (박자마다)</div><div class="util-bars"></div></div>
+  <div class="controls">
+    <button data-act="play" class="primary">흘려 보기</button>
+    <button data-act="tick">한 박자</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="say"></div>
+  <div class="log"></div>
+</div>
+
+<p>세 가지를 눈여겨보세요. 이 모델에선 workgroup마다 걸리는 시간이 정해져 있고, 한 CU에 여럿이 같이 앉아도 느려지지 않아요. 실제 GPU에선 같이 앉은 workgroup끼리 ALU와 메모리 대역폭을 나눠 써서, 아래 숫자가 그대로 성능이 되지는 않아요.</p>
+<ol>
+<li><b>꼬리(tail).</b> CU당 동시 workgroup이 1이고 걸리는 시간이 모두 같을 때, CU 64개에 workgroup 64개는 한 판, 65개는 두 판이 걸려요. 두 번째 판엔 CU 하나만 일하고 63개는 놀아요. 이 모델에선 시간이 두 배인데 일은 1.6%만 늘었어요. 사용률 막대의 마지막이 낮게 꺾이는 곳이 꼬리예요.</li>
+<li><b>판 수는 「자리 수」로 나눈 값이에요.</b> 시간이 모두 같다면 판 수 = ⌈workgroup 수 ÷ (켜진 CU 수 × CU당 동시 workgroup)⌉. 같은 workgroup 크기에서 레지스터를 줄여 CU당 동시 수용량이 늘면 분모가 커져 판 수가 줄 수 있어요. 다만 올림 때문에 그대로일 수도 있어요. 이 수용량은 occupancy와 관련 있지만, occupancy 자체는 wave 자리 가운데 실제로 찬 비율이에요. 그리고 수용량이 늘었다고 빨라진다는 보장은 없어요.</li>
+<li><b>걸리는 시간이 제각각이면</b> 판의 경계가 흐려져요. 먼저 끝난 CU가 다음 workgroup을 바로 받아요. 모두 끝나는 때는 workgroup마다 「시작한 때 + 걸린 시간」 중 가장 늦은 값이에요. 늦게 시작한 것뿐 아니라, 일찍 시작했어도 오래 걸리는 것이 꼬리를 만들 수 있어요.</li>
+</ol>
+
+<div class="note">장난감 규칙이에요: 디스패처가 SE를 차례로 돌며 한 workgroup씩 주고, SE 안에서는 빈자리가 가장 많은 CU에 앉혀요. 실제 분배 순서는 하드웨어 세부이고 공개된 정의가 없어요. 「일반 모드에선 한 workgroup은 한 CU에, RDNA WGP 모드에선 한 WGP에」(<code>TG_SPLIT</code> 제외), 「자원이 남아야 앉는다」 두 가지만 실제 제약을 따랐어요.</div>
+
+<h2 id="s3">3. 깨어난 wave는 자기가 누군지 레지스터로 알아요</h2>
+
+<p>wave가 CU에 앉으면, 첫 명령을 실행하기 전에 하드웨어가 레지스터 몇 칸을 미리 채워 둬요. LLVM 문서가 설명하는 경로에선 user SGPR은 CP가, workgroup 번호는 ADC가, local id VGPR은 SPI가 채워요. 커널 코드에는 「나는 몇 번째 work-item인가」를 묻는 명령이 따로 없어요. <b>이미 레지스터에 들어 있는 값을 읽을 뿐</b>이에요. 무엇을 어디에 넣을지는 <code>COMPUTE_PGM_RSRC2</code>의 필드가 정해요.</p>
+
+<table class="tbl">
+<thead><tr><th>칸</th><th>들어가는 것</th><th>정하는 필드</th></tr></thead>
+<tbody>
+<tr><td>SGPR 앞쪽 <i>n</i>칸</td><td><code>COMPUTE_USER_DATA_0…</code>에 드라이버가 써 둔 값을 그대로 복사</td><td><code>USER_SGPR</code> = <i>n</i></td></tr>
+<tr><td>그다음 SGPR</td><td>이 wave가 속한 workgroup의 번호(x, 켜면 y·z도)</td><td><code>TGID_X_EN</code>·<code>TGID_Y_EN</code>·<code>TGID_Z_EN</code></td></tr>
+<tr><td>VGPR <code>v0</code> (레인마다)</td><td>그 레인의 workgroup 안 번호(local id x)</td><td><code>TIDIG_COMP_CNT</code> (0·1·2 = x·xy·xyz)</td></tr>
+</tbody>
+</table>
+
+<p>user SGPR에 무엇이 오는지는 드라이버마다 달라요. radv는 디스크립터 세트 주소나 push constant를, ROCm은 커널 인자 주소 같은 것을 둬요(ROCm에서도 인자 주소가 늘 <code>s0:s1</code>인 건 아니에요). 아래 예시는 user SGPR 두 칸과 workgroup 번호 x만 켜서, <code>s0:s1</code>에 인자 주소, <code>s2</code>에 workgroup 번호 x가 와요. workgroup과 wave를 골라 보고, 레인을 눌러 global id를 맞혀 보세요.</p>
+
+<div class="sim" id="sim-wake">
+  <div class="sim-title">시뮬레이터 2 · wave가 깨어날 때의 레지스터</div>
+  <div class="controls">
+    <label class="inline">local size <select data-k="lws"><option>64</option><option>128</option><option selected>256</option></select></label>
+    <label class="inline">wave <select data-k="ws"><option>64</option><option>32</option></select></label>
+    <label class="inline">workgroup 번호 <select data-k="wg"><option>0</option><option>1</option><option>2</option><option selected>3</option><option>7</option></select></label>
+  </div>
+  <div class="pkt"></div>
+  <div class="wavepick"></div>
+  <div class="regs"></div>
+  <div class="vgrid"></div>
+  <div class="say"></div>
+</div>
+
+<p><code>get_global_id(0)</code>은 함수 호출처럼 보이지만 그런 명령은 없어요. 이 예시처럼 1차원, workgroup 크기가 고르고, global offset이 0이고, 32비트로 충분하면 「workgroup 번호 × local size + local id」로 계산할 수 있어요. 실제 명령 수와 모양은 정수 폭(OpenCL의 id는 <code>size_t</code>), 최적화(2의 거듭제곱이면 shift), ABI에 따라 달라져요. 여기 표시한 user SGPR과 workgroup 번호 SGPR은 같은 workgroup의 wave끼리 같고, <code>v0</code>만 wave마다, 레인마다 달라요. 표에 없는 SGPR 중엔 wave마다 다른 것(scratch offset 등)도 있어요.</p>
+
+<h2 id="s4">4. 순서는 약속이 아니에요</h2>
+
+<p>시뮬레이터 1에서 「걸리는 시간이 다름」을 켜면, 끝난 순서가 workgroup 번호 순서와 어긋나요. 실제 GPU에선 시작 순서도 정해져 있지 않아요. 일반적인 dispatch에서 <b>workgroup 번호 순서나 workgroup끼리 같이 떠 있다는 것에 기대면 안 돼요</b>. OpenCL은 workgroup이 어떤 순서로도 실행될 수 있다고 적어 두었고, Vulkan도 그런 보장을 하지 않아요. 같은 dispatch 안에서 workgroup끼리 서로를 기다리는 코드(workgroup 7이 workgroup 3의 결과를 돌며 기다리기)는 CU가 모자라 3이 아직 앉지도 못했을 때 영원히 멈출 수 있어요. 플래그를 atomic으로 제대로 써도 마찬가지예요. 이건 메모리 순서가 아니라 진행 보장의 문제라서, 커널 안의 <code>barrier()</code>로도 못 풀어요. workgroup 사이의 순서가 필요하면 일을 dispatch 둘로 나누고 API에서 의존성을 걸어요. Vulkan에선 pipeline barrier로 실행·메모리 의존성을, OpenCL에선 in-order 큐의 순서나 event를 써요. 1장 5절의 배리어가 그 자리예요.</p>
+
+<p>CU 마스크도 같은 그림으로 볼 수 있어요. <code>COMPUTE_STATIC_THREAD_MGMT_SE0…</code>는 SE마다 「이 CU들만 써라」는 비트예요. 드라이버는 보통 전부 켜지만, ROCm의 CU masking처럼 큐 하나가 일부 CU만 쓰게 묶어 둘 수도 있어요. 리눅스 KFD는 큐의 CU 마스크를 하드웨어 배치에 맞게 바꿔 그 큐의 MQD(<code>compute_static_thread_mgmt_se*</code>)에 적어요. RDNA에선 WGP(CU 두 개) 단위로 묶여요. 이건 그 큐가 쓸 자원을 좁히는 것일 뿐, 나머지 CU를 끄거나 남이 못 쓰게 독점하는 게 아니에요. 시뮬레이터 1에서 마스크를 절반으로 바꾸면 같은 일이 대략 두 배의 판으로 늘어나요.</p>
+
+<h2 id="s5">5. 손으로 만들어 보기</h2>
+
+<p><a href="https://jayinlab.github.io/nand-game/">NAND 게임</a> 7부(CU·스케줄)는 이 장의 장난감 판이에요. CU 둘에 workgroup 넷을 직접 나눠 보고, <code>s3</code>에 든 workgroup 번호로 자기 몫의 주소를 계산하고, VGPR 예산이 동시 wave 수를 깎는 걸 손으로 겪어요. 이 장은 그걸 SE 넷, CU 예순넷의 크기로 다시 보는 자리예요.</p>
+
+<h2>핵심 정리</h2>
+<div class="summary">
+<ul>
+<li>디스패처가 받는 건 레지스터 몇 개예요. 대표적으로 <code>DISPATCH_DIRECT</code>의 workgroup 수, <code>COMPUTE_NUM_THREAD_*</code>의 축마다 크기, <code>COMPUTE_PGM_RSRC1/2</code>의 자원 사용량과 「미리 넣어 줄 값」.</li>
+<li>한 workgroup은 한 CU(WGP 모드에선 한 WGP)에 통째로 앉고(<code>TG_SPLIT</code> 모드는 예외), 자원이 남아야 앉아요. 자리가 없으면 기다렸다가 자리가 날 때 앉아요.</li>
+<li>시간이 모두 같은 모델에선 판 수 = ⌈workgroup 수 ÷ (켜진 CU × CU당 동시 workgroup)⌉. 마지막 판이 조금만 차면 그게 꼬리예요.</li>
+<li>wave는 깨어날 때 user SGPR(드라이버가 준 값, CP가 넣음), workgroup 번호 SGPR(ADC), <code>v0</code>의 local id(SPI)를 받아요. 단순한 경우 <code>get_global_id</code>는 이 값으로 하는 곱셈과 덧셈이에요.</li>
+<li>workgroup 사이의 순서와 동시 실행은 보장되지 않아요. 순서가 필요하면 dispatch를 나누고 API에서 의존성을 걸어요.</li>
+</ul>
+</div>
+
+<h2>확인 퀴즈</h2>
+<div id="quiz"></div>
+
+<h2>더 읽기</h2>
+<p>블로그에서 이 장의 디스패처를 다른 각도로 다룬 글이에요.</p>
+<ul>
+<li><a href="https://jayinlab.github.io/opencl-note-workgroup-wavefront-dispatch/">work-group → wavefront: dispatch 한 번으로 GPU 안에서 무슨 일이 벌어지나</a> — 1절과 2절의 쪼개기</li>
+<li><a href="https://jayinlab.github.io/opencl-note-gws-lws-to-vulkan-dispatch/">OpenCL GWS/LWS가 Vulkan Dispatch로 내려갈 때</a> — groupCount와 local size</li>
+<li><a href="https://jayinlab.github.io/gpu-occupancy/">Occupancy — CU 슬롯을 얼마나 채웠나</a> — 「CU당 동시 workgroup」이 나오는 계산</li>
+<li><a href="https://jayinlab.github.io/opencl-note-kernel-dispatch-abi/">kernel dispatch ABI</a> — 3절의 user data 계약</li>
+</ul>
+
+<h2>여기까지가 사실, 여기부터가 단순화</h2>
+<p><b>공개 자료로 확인한 것.</b> 레지스터와 필드 이름(<code>COMPUTE_NUM_THREAD_X</code>, <code>COMPUTE_PGM_RSRC1</code>의 <code>VGPRS</code>·<code>SGPRS</code>, <code>COMPUTE_PGM_RSRC2</code>의 <code>USER_SGPR</code>·<code>TGID_X_EN</code>·<code>TIDIG_COMP_CNT</code>·<code>LDS_SIZE</code>, <code>COMPUTE_USER_DATA_*</code>, <code>COMPUTE_RESOURCE_LIMITS</code>, <code>COMPUTE_STATIC_THREAD_MGMT_SE*</code>)은 Mesa <code>src/amd/common/sid.h</code>와 radv의 compute dispatch 코드(<code>radv_cmd_buffer.c</code>)를 따랐어요. wave가 깨어날 때 켜진 user SGPR 다음에 workgroup 번호 SGPR이 빈칸 없이 오고 <code>v0</code>에 local id가 들어온다는 것, user SGPR은 CP·workgroup 번호는 ADC·VGPR은 SPI가 채운다는 것은 LLVM AMDGPU 문서(AMDGPUUsage)의 「Initial Kernel Execution State」를 따랐어요. LLVM 표에서 packed work-item ID로 표시된 세대(gfx90a, gfx940 계열, gfx11·gfx12 계열 등)는 local id를 <code>v0</code> 하나에 x·y·z 10비트씩 묶어 넣지만, 이 장은 1차원이라 x만 봐요. RDNA에서 <code>RSRC1.SGPRS</code>를 0으로 두고 SGPR 128개가 늘 잡힌다는 것과 <code>TG_SPLIT</code> 모드는 같은 LLVM 문서를, CU 마스크가 MQD로 가는 길은 리눅스 <code>drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager*.c</code>를, SPI의 역할은 AMD ROCm 문서를 따랐어요. workgroup 사이의 순서를 보장하지 않는다는 건 OpenCL·Vulkan 사양의 실행 모델을 따랐어요.</p>
+<p><b>모델의 가정.</b> CP 프런트엔드·ADC·SPI의 일을 「디스패처」 하나로 묶었어요. workgroup을 SE에 차례로 주고 SE 안에선 빈자리가 많은 CU에 준다는 규칙, 「SE 4 × CU 16」 GPU, 박자와 걸리는 시간은 지어낸 값이에요. 「CU당 동시 workgroup」은 실제로는 VGPR·LDS(GCN에선 SGPR도)·wave 자리·<code>COMPUTE_RESOURCE_LIMITS</code>가 함께 정하는 값을 숫자 하나로 받은 거예요. 한 CU에 여럿이 같이 앉아도 각자 시간이 그대로라는 것도 가정이에요. 시뮬레이터 2의 인자 주소와 「user SGPR 두 칸」은 예시예요.</p>
+
+<footer>
+<p>1판 · 2026-11-09 · Claude가 쓰고 OCL(GPT)이 사실 검토한 글이에요. 틀린 곳을 찾으면 리포 이슈로 알려 주세요.</p>
+</footer>
+
+</main>
+<script src="../assets/map.js"></script>
+<script src="../assets/ch03.js"></script>
+</body>
+</html>
