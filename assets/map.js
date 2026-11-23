@@ -71,6 +71,13 @@ const CHAPTERS = [
     touch: ['cu', 'regs', 'cp', 'fence', 'wait', 'umd'],
     at: { cache: 's1', regs: 's1', cu: 's2', umd: 's4', cp: 's4', fence: 's4', wait: 's4' },
   },
+  {
+    id: 'ch05', no: '05', status: 'published', color: 'var(--c5)',
+    title: '컴파일러 — 커널은 두 번 번역돼요', href: 'ch05/',
+    main: ['clspv', 'compiler'],
+    touch: ['app', 'angle', 'vk', 'regs', 'disp'],
+    at: { app: 's1', angle: 's1', vk: 's1', clspv: 's2', compiler: 's3', regs: 's4', disp: 's4' },
+  },
 ];
 
 const NS = 'http://www.w3.org/2000/svg';

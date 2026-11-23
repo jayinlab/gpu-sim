@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5장 · 컴파일러</title>
+<meta name="description" content="OpenCL C 커널이 clspv로 SPIR-V가 되고, Vulkan 드라이버의 컴파일러가 그걸 ISA로 바꾸며 VGPR 수를 정하기까지. workgroup 크기가 레지스터 천장을 정하는 이유.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+
+<p class="crumb"><a href="../">GPU Sim</a> · 5장</p>
+<h1>컴파일러 — 커널은 두 번 번역돼요</h1>
+<p class="lead">3장에서 디스패처는 <code>COMPUTE_PGM_RSRC1</code>에서 「wave 하나가 VGPR을 몇 개 쓰는지」를 읽었어요. 그 칸의 출처는 「컴파일러가 낸 사용량」이라고만 적었고요. 이 장은 그 숫자가 어디서 오는지 따라가요. OpenCL C 커널은 두 번 번역돼요. 한 번은 clspv가 SPIR-V로, 또 한 번은 Vulkan 드라이버의 컴파일러가 GPU 기계어(ISA)로요. 레지스터 수를 정하는 건 두 번째 번역이에요. 그리고 그 번역은 workgroup 크기를 알고 나서야 시작돼요.</p>
+
+<div class="note">이 장은 <b>ANGLE의 OpenCL 구현</b>(clspv + Vulkan 백엔드)과 <b>Mesa radv</b>(기본 컴파일러 ACO)를 따라가요. 숫자는 AMD GCN(GFX9) wave64를 기준으로 했고, RDNA에서 달라지는 곳은 따로 적었어요. 코드는 2026-11의 각 main 브랜치를 읽었어요. 시뮬레이터 1은 레지스터 세는 법만 남긴 장난감이에요. 시뮬레이터 2는 ACO와 radv의 계산식을 그대로 옮겼지만, SGPR과 스필에 드는 추가 레지스터는 뺐어요. 무엇이 사실이고 무엇이 가정인지는 글 끝에 나눠 적었어요.</div>
+
+<figure class="chapter-map" data-gmap="ch05">
+  <div class="gmap-wrap"></div>
+  <figcaption>이 장이 지나가는 길. 진한 칸이 주로 다루는 곳이고, 칸을 누르면 그 절로 가요. <a href="../">전체 지도</a></figcaption>
+</figure>
+
+<h2 id="s1">1. 두 번의 번역은 서로 다른 때에 일어나요</h2>
+
+<p>앱이 부르는 함수는 둘이에요. 한 번 부르는 <code>clBuildProgram</code>과 몇 번이고 부르는 <code>clEnqueueNDRangeKernel</code>이요. ANGLE 경로에서 두 번역은 이 둘에 하나씩 걸려 있어요.</p>
+
+<table class="tbl">
+<thead><tr><th>단계</th><th>누가</th><th>언제 (ANGLE)</th><th>나오는 것</th></tr></thead>
+<tbody>
+<tr><td>OpenCL C → SPIR-V</td><td>clspv (ANGLE이 라이브러리로 부름)</td><td><code>clBuildProgram</code>. 설정에 따라 worker 스레드에서 비동기로</td><td>SPIR-V, 그리고 그 안에 심은 반사 정보(<code>NonSemantic.ClspvReflection</code>)</td></tr>
+<tr><td>SPIR-V 넘기기</td><td>ANGLE → <code>vkCreateShaderModule</code></td><td>같은 빌드의 끝</td><td><code>VkShaderModule</code>. Mesa 공통 코드는 SPIR-V를 복사하고 해시를 계산할 뿐, ISA로 컴파일하지 않아요</td></tr>
+<tr><td>SPIR-V → ISA</td><td>Vulkan 드라이버의 컴파일러 (radv: SPIR-V → NIR → ACO)</td><td>enqueue 때 그 설정의 파이프라인을 얻는데, 캐시에 없으면 <code>vkCreateComputePipelines</code>로 만들어요</td><td>ISA, 그리고 자원 사용량(VGPR·SGPR·LDS·scratch). radv도 캐시에서 못 찾으면 이때 컴파일해요</td></tr>
+</tbody>
+</table>
+
+<p>왜 진짜 번역이 enqueue까지 밀릴까요? OpenCL은 workgroup 크기(local size)를 <code>clEnqueueNDRangeKernel</code>에서 정해도 돼요. 그런데 Vulkan은 파이프라인을 만들 때 이미 workgroup 크기를 알아야 해요. clspv 문서가 이 어긋남을 이렇게 풀어요. 소스의 커널이 모두 <code>reqd_work_group_size</code>를 달았으면 그 크기를 SPIR-V의 <code>LocalSize</code>에 박아요. 하나라도 안 달았으면 크기를 <b>specialization constant</b>로 비워 둬요. 그러면 ANGLE은 enqueue 때 실제 local size, global offset, 차원 수, <code>__local</code> 인자의 크기를 이 상수들에 채워서 파이프라인을 만들어요(<code>CLKernelVk::getOrCreateComputePipeline</code>). radv는 SPIR-V를 NIR로 바꿀 때(<code>spirv_to_nir</code>) 이 값을 받아요. 그래서 <b>드라이버 컴파일러는 진짜 workgroup 크기를 알고 번역해요</b>. 4절에서 이게 레지스터 천장을 바꿔요.</p>
+
+<p>함수 이름대로 이미 만든 파이프라인이 있으면 다시 쓰고, radv도 컴파일하기 전에 파이프라인 캐시부터 찾아요. 그래도 local size를 바꿔 부르면 상수 값이 달라져서 파이프라인이 새로 생길 수 있어요. 블로그의 「VkPipeline 증식」 글이 이 문제를 ANGLE 소스로 따라가요.</p>
+
+<h2 id="s2">2. clspv는 인자를 「자리」로 바꿔요</h2>
+
+<p>Vulkan SPIR-V의 entry point는 인자 없는 <code>void</code> 함수여야 해요. 그래서 커널 인자는 함수 밖에 선언한 변수가 돼요. 종류와 옵션에 따라 descriptor 리소스(set과 binding 번호), push constant, <code>Workgroup</code> 변수 중 하나로 옮겨져요. clspv 문서의 예시 커널이에요.</p>
+
+<pre class="code">kernel void foo(global int* a, float f, global float* b, uint c);</pre>
+
+<table class="tbl">
+<thead><tr><th>인자</th><th>clspv 기본 대응</th><th>바꾸는 옵션</th></tr></thead>
+<tbody>
+<tr><td><code>a</code>, <code>b</code> (global 포인터)</td><td>storage buffer 하나씩. set 0의 binding 0, 1</td><td><code>constant</code> 포인터는 <code>-constant-args-ubo</code>면 uniform buffer</td></tr>
+<tr><td><code>f</code>, <code>c</code> (스칼라 같은 POD)</td><td>둘을 한 구조체로 묶어 storage buffer 하나. binding 2, <code>f</code>는 오프셋 0, <code>c</code>는 4</td><td><code>-pod-ubo</code>(uniform buffer) · <code>-pod-pushconstant</code>(push constant) · <code>-cluster-pod-kernel-args=0</code>(묶지 않음)</td></tr>
+<tr><td><code>local</code> 포인터</td><td>descriptor 없음. <code>Workgroup</code> 저장소의 배열이 되고, 길이는 specialization constant</td><td>—</td></tr>
+</tbody>
+</table>
+
+<p>2026-11 main의 ANGLE이 clspv 옵션을 조립하는 코드(<code>ClspvGetCompilerOptions</code>)엔 POD 옵션이 없어요. 다만 이 장의 근거는 옵션 조립 코드까지이고, 실제로 어떤 descriptor가 쓰였는지는 반사 정보를 보고 정해요. work-item 함수도 같은 식으로 Vulkan의 내장 변수가 돼요.</p>
+
+<table class="tbl">
+<thead><tr><th>OpenCL C</th><th>SPIR-V</th></tr></thead>
+<tbody>
+<tr><td><code>get_global_id()</code></td><td><code>GlobalInvocationId</code>. global offset을 켜면(ANGLE은 <code>--global-offset</code>을 넘겨요) offset을 더함</td></tr>
+<tr><td><code>get_local_id()</code> · <code>get_group_id()</code></td><td><code>LocalInvocationId</code> · <code>WorkgroupId</code></td></tr>
+<tr><td><code>get_local_size()</code> · <code>get_num_groups()</code></td><td><code>WorkgroupSize</code> · <code>NumWorkgroups</code></td></tr>
+</tbody>
+</table>
+
+<p>work-item 함수는 SPIR-V 본문에서 이 내장 변수를 쓰는 식으로 구현돼요. 따로, 인자의 descriptor binding·오프셋이나 필요한 specialization constant 같은 메타데이터는 SPIR-V 안에 <code>NonSemantic.ClspvReflection</code> 명령으로 들어 있어요. ANGLE은 그걸 읽어 descriptor set layout과 push constant 범위를 만들고, 인자를 받으면 그 자리에 써 넣어요. 드라이버가 <code>VK_KHR_shader_non_semantic_info</code>를 지원하지 않으면, 넘기기 전에 반사 정보를 떼어 낸 SPIR-V를 써요. 3장에서 wave가 깨어날 때 받던 <code>v0</code>의 local id와 workgroup 번호 SGPR은, 두 번째 컴파일러가 이 내장 변수들을 계산하는 재료예요.</p>
+
+<p>여기까지 SPIR-V에는 <b>레지스터가 없어요</b>. 값마다 이름(SSA id)만 붙어 있어요. 그 이름들을 진짜 VGPR·SGPR 칸에 앉히는 건 다음 절의 일이에요. 블로그 오답노트 「SPIR-V를 GPU 기계코드로 오해했던 문제」가 이 경계를 다뤄요.</p>
+
+<h2 id="s3">3. 두 번째 번역이 레지스터 수를 정해요</h2>
+
+<p>radv는 <code>vkCreateComputePipelines</code>에서 SPIR-V를 NIR로 바꾸고, NIR 단계의 최적화를 거친 뒤 ACO에 넘겨요(<code>RADV_DEBUG=llvm</code>이면 LLVM). ACO가 레지스터에 관해 하는 일은 이 순서예요(<code>aco_interface.cpp</code>).</p>
+
+<ol>
+<li><b>살아 있는 값 분석</b>(<code>live_var_analysis</code>) — 명령마다 「지금 붙잡고 있어야 하는 값」을 세요. 이 장에선 이걸 그 지점의 압박이라고 불러요.</li>
+<li><b>스필</b>(<code>spill</code>) — 압박이 쓸 수 있는 레지스터보다 크면 값을 다른 곳에 잠깐 내려놓아요. 대표적인 곳이 메모리(scratch)이고, SGPR을 VGPR의 빈 레인에 두거나 조건에 따라 LDS에 두기도 해요. 4절에서 다시 봐요.</li>
+<li><b>스케줄</b>(<code>schedule_program</code>) — 메모리 읽기를 앞당기는 식으로 명령 순서를 바꿔요. 순서가 바뀌면 압박도 바뀌어요.</li>
+<li><b>레지스터 할당</b>(<code>register_allocation</code>) — 값마다 진짜 VGPR·SGPR 번호를 정해요. 번호는 0부터라, 쓴 가장 큰 번호에 1을 더하고 할당 단위와 추가 예약분을 반영한 값이 그 커널의 사용량이 돼요.</li>
+</ol>
+
+<p>VGPR과 SGPR은 값의 모양으로 갈라요. 레인마다 다른 값(<code>x[i]</code>)은 보통 VGPR에 두고, wave 전체가 같은 값(모든 레인이 같은 주소에서 읽는 가중치)은 가능하면 SGPR을 써요. 그래서 컴파일러는 값마다 「레인끼리 다를 수 있나」도 따져요. 다만 같은 값이라도 연산과 피연산자 제약 때문에 VGPR에 둘 때가 있어요.</p>
+
+<p>3번 스케줄이 이 장의 핵심 거래예요. 메모리 읽기를 일찍 띄워 두면 wave 하나는 덜 기다려요. 대신 읽어 온 값을 쓸 때까지 레지스터에 붙잡아 둬야 해서 VGPR을 더 써요. VGPR을 더 쓰면 SIMD 하나에 같이 올라갈 수 있는 wave가 줄어요. ACO 스케줄러는 주석에 이 거래를 그대로 적어 두었어요. 「wave를 조금 내주고 VGPR을 더 써서 스케줄을 좋게 한다. 다만 이미 최소보다 적으면 더 줄이지 않는다.」 그 최소는 GFX9 wave64에서 SIMD당 4개예요. workgroup이 더 많이 요구하면 그 수가 최소가 돼요.</p>
+
+<p>아래는 float4 여덟 개를 읽어 가중치와 곱해 더하는 커널을, 컴파일러가 반복문을 풀어 쓴 모습이에요. 「미리 띄울 읽기」를 바꾸면 명령 순서가 바뀌어요. 줄마다 그 줄이 끝난 뒤 붙잡고 있는 VGPR을 막대로 그렸어요. 가장 긴 막대가 이 모델에서 동시에 살아 있는 VGPR의 최댓값이에요. 실제 할당량과 꼭 같지는 않아요. 명령은 실제 ISA를 닮게 쓴 의사코드예요.</p>
+
+<div class="codepair">
+<pre class="code">kernel void dot8(global const float4 *x,
+                 constant float4 *w,
+                 global float *out) {
+  size_t i = get_global_id(0);
+  float4 acc = 0;
+  for (int k = 0; k &lt; 8; k++)
+    acc += x[i * 8 + k] * w[k];
+  out[i] = acc.x + acc.y + acc.z + acc.w;
+}</pre>
+<pre class="code">// 이 장의 셈법
+i        VGPR 1칸 (레인마다 다름)
+주소      VGPR 2칸 (64비트)
+x[...]   VGPR 4칸 (float4)
+acc      VGPR 4칸
+w[k]     SGPR로 읽는다고 가정 — VGPR 셈에서 뺌</pre>
+</div>
+
+<div class="sim" id="sim-live">
+  <div class="sim-title">시뮬레이터 1 · 살아 있는 값 세기</div>
+  <div class="controls">
+    <label class="inline">미리 띄울 읽기 <select data-k="d"><option>1</option><option selected>2</option><option>4</option><option>8</option></select></label>
+    <label class="inline">이 구간 내내 살아 있는 다른 VGPR <select data-k="base"><option selected>0</option><option>24</option><option>56</option></select></label>
+  </div>
+  <ol class="livelist"></ol>
+  <div class="kv"></div>
+  <div class="say"></div>
+</div>
+
+<p>읽기를 하나만 띄우면 wave는 읽을 때마다 기다리지만, VGPR은 몇 칸 안 써요. 여덟 개를 다 띄우면 기다림은 한 번에 겹치지만, float4 여덟 개를 동시에 붙잡느라 VGPR이 세 배가 돼요. 「이 구간 내내 살아 있는 다른 VGPR」을 올려 보세요. 이 구간을 지나는 동안 다른 값도 붙잡고 있으면, 작은 VGPR 차이도 경계를 넘을 때 SIMD당 wave 수를 깎아요. 반대로 몇 칸을 줄여도 wave 수가 그대로인 구간도 있어요(56이면 68·72·80칸이 모두 3개). 어느 쪽이 더 빠른지는 이 모델로 정하지 않아요. 남은 wave들이 서로의 기다림을 얼마나 메우는지(1장·NAND 게임 7부), 메모리 대역폭이 먼저 막히는지에 따라 답이 달라져요. 그래서 컴파일러도 「최소 몇 개는 남긴다」 같은 휴리스틱으로 고르는 거예요.</p>
+
+<div class="note">장난감 규칙이에요. 기다림(<code>s_waitcnt</code>) 줄이 아닌 의사명령 한 줄은 1박자이고, 기다림 줄은 필요한 대기 시간만 더해요. 메모리 읽기는 30박자 뒤에 도착하고, 여러 읽기가 동시에 날아갈 수 있어요. 막대는 그 줄이 끝난 뒤에도 쓰일 값만 세요. 실제 할당기는 SGPR 묶음의 정렬, 명령마다의 피연산자 제약, 같은 명령 안에서 끝나는 값의 칸을 다시 쓰는 일까지 따져서 숫자가 조금씩 달라요. 박자 수와 30박자, 「다른 VGPR」 숫자는 지어낸 값이에요. 「다른 VGPR」은 커널 다른 구간의 사용량이 아니라, 이 구간 내내 함께 살아 있는 값이라고 둬요(그래야 더할 수 있어요). VGPR 할당 단위(GFX9 wave64는 4칸)와 SIMD당 wave 수의 계산은 radv를 따랐어요.</div>
+
+<h2 id="s4">4. workgroup 크기가 레지스터 천장을 정해요</h2>
+
+<p>3장에서 workgroup은 한 CU에 통째로 앉는다고 했어요. GFX9의 CU에는 SIMD가 넷이고, SIMD 하나의 VGPR은 레인마다 256칸이에요(wave64 기준). local size가 1024면 wave가 16개이니, 한 CU에 앉으려면 SIMD마다 wave 4개가 같이 올라가야 해요. 그러면 wave 하나가 쓸 수 있는 VGPR은 256 ÷ 4 = <b>64칸</b>이 천장이에요. ACO는 이 계산을 그대로 해요. workgroup 하나에 필요한 SIMD당 최소 wave 수(<code>calc_min_waves</code>)로 쓸 수 있는 레지스터를 구하고(<code>get_addr_regs_from_waves</code>), 압박이 그보다 크면 스필이나 재계산으로 압박을 줄여요. 시뮬레이터 2는 넘친 VGPR을 모두 scratch로 내보낸다고 가정해요.</p>
+
+<p>1절과 이어 보면 이렇게 돼요. 같은 OpenCL 커널이라도 local size 256으로 enqueue하면 VGPR 80칸을 그대로 쓰고, 1024로 enqueue하면 64칸 천장에 걸려 스필하는 ISA가 될 수 있어요. ANGLE이 local size를 specialization constant로 넘기니, 드라이버 컴파일러는 <b>그때그때 다른 천장으로</b> 번역해요.</p>
+
+<div class="sim" id="sim-cap">
+  <div class="sim-title">시뮬레이터 2 · 천장과 스필 (GFX9 · wave64 · CU 하나)</div>
+  <div class="controls">
+    <label class="inline">local size <select data-k="L"><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option></select></label>
+    <label class="inline">커널이 원하는 VGPR <select data-k="need"><option>24</option><option>40</option><option>64</option><option selected>80</option><option>96</option><option>128</option><option>200</option></select></label>
+    <label class="inline">workgroup당 LDS <select data-k="lds"><option value="0" selected>없음</option><option value="8192">8 KB</option><option value="16384">16 KB</option><option value="32768">32 KB</option></select></label>
+  </div>
+  <div class="vfile-name">가장 많이 올라가는 SIMD 하나의 VGPR (레인마다 256칸 · 한 칸 = 4개)</div>
+  <div class="vfile"></div>
+  <div class="vlegend"></div>
+  <div class="kv"></div>
+  <div class="say"></div>
+</div>
+
+<p>세 가지를 눌러 보세요.</p>
+<ol>
+<li><b>local size 256 → 1024</b>(VGPR 80). 천장이 256에서 64로 내려오고, 넘친 16칸이 스필돼요. 이 모델처럼 scratch를 쓰는 코드가 생기면 <code>COMPUTE_PGM_RSRC2</code>의 <code>SCRATCH_EN</code>이 켜지고, 드라이버는 scratch 메모리를 마련해야 해요. 스필한 값은 다시 쓸 때 메모리에서 읽어 와야 해서 느려질 수 있어요.</li>
+<li><b>VGPR 80 → 64</b>(local size 256). SIMD당 wave가 3개에서 4개로 늘어요. 할당 단위가 4칸이라 61~64는 모두 같은 4개예요. 1칸 줄였다고 늘 한 wave가 느는 건 아니에요.</li>
+<li><b>LDS 32 KB</b>. GFX9 CU의 LDS는 64 KB라서 workgroup이 둘까지만 앉아요. VGPR이 남아도 wave 수가 LDS에 막힐 수 있어요.</li>
+</ol>
+
+<p>SGPR도 GCN에선 같은 식으로 wave 수를 깎을 수 있어요(radv: SIMD당 800칸, 16칸 단위). RDNA에선 SGPR이 wave마다 고정이라 wave 수를 깎지 않아요. 대신 VGPR 파일이 더 크고(wave64로 쳐서 512칸, Navi31 등은 768칸) 할당 단위와 SIMD당 최대 wave 수도 달라요. 블로그 <a href="https://jayinlab.github.io/gpu-occupancy/">Occupancy</a> 글이 같은 자원 제한 원리를 가상 CU로 다뤄요.</p>
+
+<h3>그 숫자가 RSRC 칸이 되기까지</h3>
+
+<p>컴파일이 끝나면 ACO는 사용량을 <code>ac_shader_config</code>에 담아 돌려줘요. radv는 이 값을 3장의 레지스터 칸에 맞게 인코딩해요(<code>radv_postprocess_binary_config</code>).</p>
+
+<table class="tbl">
+<thead><tr><th>컴파일러가 낸 값</th><th>들어가는 칸</th><th>radv의 인코딩</th></tr></thead>
+<tbody>
+<tr><td>VGPR 수 <i>n</i></td><td><code>COMPUTE_PGM_RSRC1.VGPRS</code></td><td>(<i>n</i> − 1) ÷ 4 (wave64) · (<i>n</i> − 1) ÷ 8 (wave32), 나머지 버림</td></tr>
+<tr><td>SGPR 수 <i>m</i></td><td>GFX9: <code>RSRC1.SGPRS</code> · RDNA: 없음</td><td>(<i>m</i> − 1) ÷ 8. <i>m</i>은 컴파일러가 보고한 수와 「ABI 입력 SGPR 수 + 5」 중 큰 값이에요. +5는 소스 주석상 링 오프셋 2칸과 scratch wave 오프셋·VCC 3칸이에요. RDNA는 0으로 두고 128칸이 고정으로 잡혀요(3장)</td></tr>
+<tr><td>user SGPR 수</td><td><code>RSRC2.USER_SGPR</code></td><td>그대로 (드라이버가 정한 칸 수)</td></tr>
+<tr><td>scratch 사용량 &gt; 0</td><td><code>RSRC2.SCRATCH_EN</code></td><td>1. scratch를 쓰지 않는 스필(SGPR→VGPR 등)만 있으면 켜지지 않아요</td></tr>
+<tr><td>LDS 크기</td><td><code>RSRC2.LDS_SIZE</code></td><td>할당 단위로 인코딩</td></tr>
+</tbody>
+</table>
+
+<p>이 숫자들은 앱에서도 볼 수 있어요. radv는 <code>VK_KHR_pipeline_executable_properties</code>로 파이프라인마다 SGPR·VGPR 수, 스필한 SGPR·VGPR, 코드 크기, LDS, scratch, 최대 wave 수를 알려 줘요(<code>radv_GetPipelineExecutableStatisticsKHR</code>). 다만 <code>pipelineExecutableInfo</code> 기능을 켜고, <code>VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR</code>로 만든 파이프라인에서만 물어볼 수 있어요.</p>
+
+<h2 id="s5">5. 손으로 만들어 보기</h2>
+
+<p><a href="https://jayinlab.github.io/nand-game/">NAND 게임</a>에서 이 장을 손으로 해 볼 수 있어요. 7부 「레지스터 아끼기」는 VGPR이 레인마다 8칸뿐인 CU에서 wave 하나가 쓰는 칸을 줄여, 같이 올라가는 wave를 늘려요. 4절 시뮬레이터의 장난감판이에요. 9부 「레지스터 배정」과 「두 칸에 앉히기」에선 임시 값 t1~t5의 살아 있는 구간을 보고 진짜 레지스터에 직접 앉혀요. 3절에서 ACO의 레지스터 할당이 하는 일을 손으로 하는 거예요.</p>
+
+<h2>핵심 정리</h2>
+<div class="summary">
+<ul>
+<li>ANGLE 경로의 OpenCL 커널은 두 번 번역돼요. <code>clBuildProgram</code>에서 clspv가 SPIR-V로, 그 커널을 그 설정으로 처음 enqueue할 때 드라이버 컴파일러(radv: NIR → ACO)가 ISA로요.</li>
+<li>OpenCL은 local size를 enqueue 때 정해도 되지만 Vulkan은 파이프라인을 만들 때 알아야 해요. 그래서 clspv는 크기를 specialization constant로 비워 두고(모든 커널에 <code>reqd_work_group_size</code>가 있으면 박아 두고), ANGLE이 enqueue 때 채워요.</li>
+<li>clspv의 기본 descriptor 경로에서 global·constant 포인터는 storage buffer로, POD 인자는 한 구조체로 묶여 storage buffer 하나로, local 포인터는 Workgroup 배열로 바뀌어요. 인자 대응은 SPIR-V 안의 반사 정보로 남아요. SPIR-V에는 아직 레지스터가 없어요.</li>
+<li>VGPR 수는 드라이버 컴파일러가 살아 있는 값을 세고, 스케줄하고, 할당해서 정해요. 읽기를 앞당기면 wave 하나는 덜 기다리지만 VGPR을 더 써서 같이 올라갈 wave가 줄어요.</li>
+<li>workgroup은 한 CU에 통째로 앉아야 하니 local size가 레지스터 천장을 정해요. GFX9 wave64에서 local size 1024면 천장은 VGPR 64칸이고, 넘으면 스필하고, scratch를 쓰게 되면 <code>RSRC2.SCRATCH_EN</code>이 켜져요.</li>
+</ul>
+</div>
+
+<h2>확인 퀴즈</h2>
+<div id="quiz"></div>
+
+<h2>더 읽기</h2>
+<p>블로그에서 이 장의 컴파일 경로를 다른 각도로 다룬 글이에요.</p>
+<ul>
+<li><a href="https://jayinlab.github.io/opencl-note-clspv-practice/">clspv 실전 — vector_add 커널을 SPIR-V로 변환하고 대응표 만들기</a> — 2절의 인자 대응을 직접 돌려 보기. 다만 옵션 없이 컴파일하고도 스칼라 인자 <code>n</code>을 push constant로 적었는데, clspv 기본값은 storage buffer예요. push constant가 되려면 <code>-pod-pushconstant</code>가 필요해요</li>
+<li><a href="https://jayinlab.github.io/vkpipeline-specialization-constants-proliferation/">ANGLE 소스로 보는 VkPipeline 증식 문제</a> — local size가 바뀌면 파이프라인이 늘어나는 사례. <code>reqd_work_group_size</code> 예외와, global offset·차원 수·<code>__local</code> 인자 크기 같은 다른 specialization 값도 바뀔 수 있다는 건 1절을 같이 보세요</li>
+<li><a href="https://jayinlab.github.io/spirv-to-isa-driver-path/">SPIR-V에서 ISA까지: 드라이버 백엔드가 실제로 하는 일</a> — 3절의 두 번째 번역</li>
+<li><a href="https://jayinlab.github.io/gpu-fun-fact-register-spill/">GPU register가 넘치면 어디로 흘러갈까</a> — 4절의 스필을 CUDA 쪽(local memory)에서 본 글. OpenCL의 <code>__local</code>과는 다른 말이에요</li>
+</ul>
+
+<h2>여기까지가 사실, 여기부터가 단순화</h2>
+<p><b>공개 자료로 확인한 것.</b> ANGLE이 <code>clBuildProgram</code>에서 clspv를 부르고(비동기 빌드 포함) 같은 빌드 끝에 <code>VkShaderModule</code>을 만든다는 것, 드라이버가 non-semantic 명령을 지원하지 않으면 반사 정보를 뗀다는 것은 ANGLE <code>src/libANGLE/renderer/vulkan/CLProgramVk.cpp</code>를 따랐어요. enqueue 때 local size·global offset·work dim·<code>__local</code> 인자 크기를 specialization constant로 채워 파이프라인을 얻는다는 것은 <code>CLKernelVk.cpp</code>의 <code>getOrCreateComputePipeline</code>과 <code>CLCommandQueueVk.cpp</code>를, ANGLE이 넘기는 clspv 옵션(<code>--global-offset</code> 등, POD 옵션 없음)은 <code>clspv_utils.cpp</code>를 따랐어요. 인자와 descriptor의 대응, POD 묶기와 그 옵션, <code>local</code> 포인터, work-item 함수와 내장 변수, workgroup 크기의 specialization constant와 <code>reqd_work_group_size</code>, 반사 정보는 clspv <code>docs/OpenCLCOnVulkan.md</code>를 따랐어요. <code>vkCreateShaderModule</code>이 SPIR-V를 복사만 한다는 것은 Mesa <code>src/vulkan/runtime/vk_shader_module.c</code>를, radv가 파이프라인 생성 때 캐시를 찾고 컴파일한다는 것은 <code>radv_pipeline_compute.c</code>를, 기본 백엔드가 ACO이고 <code>RADV_DEBUG=llvm</code>이면 LLVM이라는 것은 <code>radv_physical_device.c</code>를 따랐어요. ACO의 순서(살아 있는 값 분석 → 스필 → 스케줄 → 레지스터 할당)는 <code>aco_interface.cpp</code>를, 스케줄러가 wave를 조금 내주고 VGPR을 더 쓰되 최소(<code>max(min_waves, 4)</code>, GFX10 이후는 4 대신 8) 밑으로 내려가지 않는다는 것은 <code>aco_scheduler.cpp</code>의 <code>schedule_program</code>을, workgroup 크기에서 최소 wave와 레지스터 천장을 구하는 식과 workgroup 단위로 wave 수를 맞추는 식(wave가 둘 이상인 workgroup은 CU당 16개까지라는 한도 포함)은 <code>aco_live_var_analysis.cpp</code>의 <code>calc_min_waves</code>·<code>get_addr_regs_from_waves</code>·<code>max_suitable_waves</code>를, 스필러가 그 천장을 목표로 삼는다는 것은 <code>aco_spill.cpp</code>를 따랐어요. GFX9의 SIMD당 최대 wave 10, SGPR 800칸과 16칸 단위, wave64 VGPR 256칸과 4칸 단위, CU당 SIMD 4와 LDS 64 KB, RDNA의 값은 <code>src/amd/common/ac_gpu_info.c</code>를, RSRC1·RSRC2 인코딩과 SGPR 최솟값은 <code>radv_shader.c</code>의 <code>radv_postprocess_binary_config</code>를, radv의 SIMD당 wave 계산은 같은 파일의 <code>radv_get_max_waves</code>를, 파이프라인 통계는 <code>radv_pipeline.c</code>를 따랐어요(모두 2026-11 main).</p>
+<p><b>모델의 가정.</b> 시뮬레이터 1은 <code>w[k]</code>를 SGPR로 읽는다고 두고, 명령은 실제 ISA가 아닌 의사코드이며(<code>s_load_dwordx4 ×8</code>, float4 전체의 <code>v_fma</code> 등), 기다림 줄 자체의 비용은 세지 않아요. 「다른 VGPR」은 이 구간 내내 살아 있는 추가 값이에요. 시뮬레이터 2는 넘친 VGPR을 모두 scratch로 내보낸다고 둬요. 시뮬레이터 1의 커널을 펼친 모양, 명령 순서, 값마다의 칸 수(주소 2칸 등), 「다른 VGPR」 값, 1박자 명령과 30박자 읽기, 읽기가 몇 개든 동시에 날아간다는 것은 지어낸 조건이에요. 막대는 줄이 끝난 뒤 살아 있는 값만 세고, 실제 할당기의 정렬·명령 제약·칸 재사용은 다루지 않았어요. 실제 ACO가 이 커널에 몇 개를 쓰는지는 이 숫자와 다를 수 있어요. 시뮬레이터 2는 ACO의 천장 식과 workgroup 단위 wave 식을 옮겼지만, 「커널이 원하는 VGPR」을 그 커널의 최대 압박으로 두고, 스필할 때 따로 드는 VGPR·SGPR, SGPR에 의한 제한, LDS 할당 단위, 스필한 값이 LDS로 가는 경우(ACO는 workgroup이 wave 하나일 때만), 스케줄러가 VGPR을 더 쓰는 경우는 뺐어요. 「넘친 칸 수 = 스필한 VGPR 수」도 단순화예요. 실제 스필 수와 성능 영향은 값이 어디서 얼마나 쓰이는지에 따라 달라요. clspv가 만드는 SPIR-V의 세부 모양, RDNA의 WGP 모드와 wave32, GFX12는 다루지 않았어요.</p>
+
+<footer>
+<p>1판 · 2026-11-24 · Claude가 쓰고 OCL(GPT)이 사실 검토한 글이에요. 틀린 곳을 찾으면 리포 이슈로 알려 주세요.</p>
+</footer>
+
+</main>
+<script src="../assets/map.js"></script>
+<script src="../assets/ch05.js"></script>
+</body>
+</html>

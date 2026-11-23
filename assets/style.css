@@ -17,6 +17,7 @@
   --c2: #8a4fd8;
   --c3: #12897a;
   --c4: #c0561b;
+  --c5: #b8336a;
   --wg-l: 52%;
   --on-c: #ffffff;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -41,6 +42,7 @@
     --c2: #c09bff;
     --c3: #4fd1bd;
     --c4: #ff9e64;
+    --c5: #ff85b3;
     --wg-l: 62%;
     --on-c: #10131a;
   }
@@ -352,3 +354,42 @@ pre.code { margin: 0; font: .8rem/1.6 var(--mono); background: var(--surface); b
 @media (max-width: 560px) {
   .codepair, .flagwrap, .memrow { grid-template-columns: 1fr; }
 }
+
+/* ch05 · 살아 있는 값 */
+.livelist { list-style: none; padding: 0; margin: 10px 0 4px; font-size: .82rem; }
+.livelist li { display: grid; grid-template-columns: minmax(0, 1fr) 110px 2.2em; gap: 8px; align-items: center; padding: 2px 6px; border-left: 3px solid transparent; border-radius: 0 6px 6px 0; }
+.livelist li > code { background: none; padding: 0; overflow-wrap: anywhere; }
+.livelist li .tag { grid-column: 1; justify-self: start; font-size: .7rem; padding: 0 6px; border-radius: 6px; background: var(--surface-2); color: var(--ink-2); }
+.livelist li .tag.warn { background: var(--warn-soft); color: var(--warn); }
+.livelist li.wait > code { color: var(--ink-2); }
+.livelist li.peak { background: color-mix(in srgb, var(--c5) 12%, var(--surface)); border-left-color: var(--c5); font-weight: 700; }
+.lbar { grid-column: 2; grid-row: 1; height: 10px; background: var(--surface-2); border-radius: 5px; overflow: hidden; }
+.lbar i { display: block; height: 100%; background: var(--c5); border-radius: 5px; }
+.lnum { grid-column: 3; grid-row: 1; font-family: var(--mono); font-size: .78rem; text-align: right; color: var(--ink-2); }
+.tbl.cmp { font-size: .82rem; margin: .8em 0 .2em; }
+.tbl.cmp td, .tbl.cmp th { padding: 5px 6px; }
+.tbl.cmp tr.on td { background: color-mix(in srgb, var(--c5) 12%, var(--surface)); font-weight: 700; }
+.tbl.kvt { font-size: .85rem; margin: .6em 0 .2em; }
+.tbl.kvt th { width: 42%; font-size: .82rem; }
+.tbl.kvt td, .tbl.kvt th { padding: 4px 8px; overflow-wrap: anywhere; }
+.tbl.kvt tr.bad td { color: var(--bad); }
+.tbl.kvt td b { color: var(--accent); }
+.tbl.kvt tr.bad td b { color: var(--bad); }
+
+/* ch05 · VGPR 파일 */
+.vfile-name { font-size: .72rem; color: var(--ink-2); font-weight: 700; margin-top: 12px; }
+.vfile { display: grid; grid-template-columns: repeat(16, minmax(0, 1fr)); gap: 2px; margin-top: 4px; }
+.vfile i { position: relative; aspect-ratio: 1.6 / 1; background: var(--surface-2); border: 1px solid var(--line); border-radius: 3px; }
+.vfile i.w0 { background: var(--c5); border-color: var(--c5); }
+.vfile i.w1 { background: color-mix(in srgb, var(--c5) 55%, var(--surface)); border-color: var(--c5); }
+.vfile i[data-n]::after { content: attr(data-n); position: absolute; inset: 0; font-style: normal; font-family: var(--mono); font-size: .58rem; line-height: 1; display: flex; align-items: center; justify-content: center; color: var(--on-c); }
+.vlegend { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: .8rem; color: var(--ink-2); margin-top: 6px; }
+.spillbox { display: inline-flex; align-items: center; gap: 2px; flex-wrap: wrap; color: var(--bad); }
+.spillbox i { display: inline-block; width: 14px; height: 9px; background: var(--bad-soft); border: 1px solid var(--bad); border-radius: 2px; }
+@media (max-width: 560px) {
+  .livelist li { grid-template-columns: minmax(0, 1fr) 64px 2em; font-size: .76rem; }
+  .tbl.cmp { display: block; overflow-x: auto; }
+  .vfile { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+}
+
+.tbl td code, .tbl th code { overflow-wrap: anywhere; }
