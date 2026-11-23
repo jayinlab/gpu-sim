@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4장 · 캐시와 메모리</title>
+<meta name="description" content="CU 하나가 쓴 값이 다른 CU와 호스트에게 보이기까지. L1·L2·메모리의 층과, 기다리기·무효화·내보내기가 각각 맡는 일.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+
+<p class="crumb"><a href="../">GPU Sim</a> · 4장</p>
+<h1>캐시와 메모리 — 썼다고 다 보이는 건 아니에요</h1>
+<p class="lead">1장 끝에서 barrier는 「앞의 일이 끝날 때까지 기다리기」만 하는 게 아니라고 했어요. 캐시를 비우거나 무효화하는 일도 같이 한다고요. 이 장은 그 나머지 반쪽이에요. CU 하나가 쓴 값이 다른 CU에게, 그리고 호스트에게 보이기까지 어떤 층을 지나는지, 그리고 그 길에서 「기다리기」「무효화」「내보내기」가 각각 무엇을 맡는지 따라가요.</p>
+
+<div class="note">이 장의 명령과 비트 이름은 <b>AMD GCN(GFX9)</b>을 기준으로 하고, RDNA(GFX10·11)에서 달라지는 곳은 따로 적었어요. 명령 순서는 LLVM AMDGPU 문서의 메모리 모델 표를, 패킷 비트는 Mesa와 리눅스 amdgpu를 따랐어요. 시뮬레이터는 캐시를 아주 작게 줄인 장난감이에요. 첫 번째는 주소 하나, 두 번째는 data와 flag 두 주소만 다뤄요. 무엇이 사실이고 무엇이 가정인지는 글 끝에 나눠 적었어요.</div>
+
+<figure class="chapter-map" data-gmap="ch04">
+  <div class="gmap-wrap"></div>
+  <figcaption>이 장이 지나가는 길. 진한 칸이 주로 다루는 곳이고, 칸을 누르면 그 절로 가요. <a href="../">전체 지도</a></figcaption>
+</figure>
+
+<h2 id="s1">1. 메모리로 가는 길은 층이 여럿이에요</h2>
+
+<p>wave가 <code>global_load</code>로 주소 하나를 읽으면, 값은 메모리에서 바로 오지 않고 가까운 캐시부터 찾아요. 층마다 <b>누가 나눠 쓰는지</b>가 달라요. 이 장의 이야기는 전부 이 열에서 나와요.</p>
+
+<table class="tbl">
+<thead><tr><th>층</th><th>GCN (GFX9)</th><th>RDNA (GFX10·11)</th><th>누가 나눠 쓰나</th></tr></thead>
+<tbody>
+<tr><td>벡터 캐시</td><td>vector L1</td><td>vector L0</td><td>CU 하나 (그 CU의 SIMD 전부)</td></tr>
+<tr><td>스칼라 캐시</td><td>scalar L1</td><td>scalar L0</td><td>GFX9: CU 몇 개 · RDNA: WGP 하나</td></tr>
+<tr><td>중간 층</td><td>—</td><td>L1 (GL1)</td><td>shader array 하나</td></tr>
+<tr><td>L2</td><td>L2</td><td>L2 (GL2)</td><td>GPU 하나의 CU 전부 · 주소 범위마다 채널로 나뉨</td></tr>
+<tr><td>메모리</td><td colspan="2">VRAM, 또는 시스템 메모리</td><td>매핑·접근 권한·플랫폼에 따라 CPU 등 GPU 밖 장치도 접근</td></tr>
+</tbody>
+</table>
+
+<p>읽는 법은 하나예요. <b>두 쓰레드가 같은 값을 보려면, 둘이 함께 쓰는 층에서 만나야 해요.</b> 같은 wave의 레인은 벡터 캐시를 함께 쓰니, 레인 사이의 일관성을 위해 캐시를 따로 무효화할 필요는 없어요(실행 순서와 메모리 완료 대기는 별개예요). GFX9의 벡터 메모리 경로에서는 서로 다른 CU가 L2에서 처음 만나요. RDNA에서는 같은 shader array의 CU끼리 GL1을 함께 쓰고, 다른 shader array끼리는 L2에서 만나요. 호스트는 GPU의 L2 밖에 있어요. 그래서 L2에 머문 값은 메모리까지 내려가야 할 수 있어요. 어떤 메모리를 어떤 방식으로 매핑했는지에 따라 L2를 건너뛰거나, L2가 CPU와 일관성을 맞추기도 해요.</p>
+
+<p>3장의 LDS는 이 표에 없어요. LDS는 CU(RDNA는 WGP) 안의 작은 메모리이고, LLVM 문서도 LDS 연산에는 캐시가 끼지 않는다고 적어요. 같은 workgroup끼리 나눠 쓰는 곳이라 캐시 이야기와는 따로 놀아요.</p>
+
+<h2 id="s2">2. 다른 CU의 L1은 모른 채로 남아요</h2>
+
+<p>CU 0이 주소 <code>x</code>에 새 값을 써도, CU 1의 L1에 예전에 읽어 둔 <code>x</code>가 있으면 CU 1은 그 옛값을 계속 읽어요. L1끼리는 서로 알리지 않아요. 예전 값이 벡터 L1에 남아 있으면 보통의 캐시 읽기는 옛값을 받을 수 있어요(캐시 줄이 저절로 교체되면 새 값을 볼 수도 있지만, 그건 보장이 아니에요). 이 장에서는 <b>읽는 쪽이 자기 L1을 무효화(invalidate)</b>해서 다음 읽기가 L2까지 가게 해요. 3절의 <code>glc</code> 읽기처럼 L1을 건너뛰는 길도 있어요. 호스트가 보려면 한 단계가 더 있어요. L2에 남은 새 값을 <b>메모리로 내보내기(writeback)</b>예요.</p>
+
+<p>아래에서 CU 둘, L2, 메모리, 호스트가 주소 <code>x</code> 하나를 두고 움직여요. 「장면 한 걸음」을 누르면 정해 둔 순서대로 가고, 버튼을 직접 눌러 아무 순서로나 해 봐도 돼요. 빨간 칸이 「가장 최근에 쓴 값과 다른 옛값」이에요.</p>
+
+<div class="sim" id="sim-coh">
+  <div class="sim-title">시뮬레이터 1 · 같은 주소, 두 CU</div>
+  <div class="coh">
+    <div class="cbox" data-box="l1-0"><div class="cname">CU 0 · L1</div><div class="cval"></div><div class="cstate"></div>
+      <div class="cbtns"><button data-act="read" data-c="0">읽기</button><button data-act="write" data-c="0">쓰기 +1</button><button data-act="inv" data-c="0">L1 무효화</button></div></div>
+    <div class="cbox" data-box="l1-1"><div class="cname">CU 1 · L1</div><div class="cval"></div><div class="cstate"></div>
+      <div class="cbtns"><button data-act="read" data-c="1">읽기</button><button data-act="write" data-c="1">쓰기 +1</button><button data-act="inv" data-c="1">L1 무효화</button></div></div>
+    <div class="cbox wide" data-box="l2"><div class="cname">L2 · GPU 전체</div><div class="cval"></div><div class="cstate"></div>
+      <div class="cbtns"><button data-act="wb">메모리로 내보내기</button></div></div>
+    <div class="cbox" data-box="mem"><div class="cname">메모리</div><div class="cval"></div><div class="cstate"></div></div>
+    <div class="cbox host" data-box="host"><div class="cname">호스트 (CPU)</div><div class="cval"></div><div class="cstate"></div>
+      <div class="cbtns"><button data-act="host">메모리 읽기</button></div></div>
+  </div>
+  <div class="controls">
+    <button data-act="step" class="primary">장면 한 걸음</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="say"></div>
+  <div class="log"></div>
+</div>
+
+<p>장면을 끝까지 넘기면 두 가지가 남아요.</p>
+<ol>
+<li><b>무효화는 읽는 쪽의 일이에요.</b> CU 0이 아무리 확실하게 써도, CU 1의 L1에 옛값이 남아 있으면, CU 1이 무효화하거나 L1을 건너뛰어 읽기 전까지는 그 값을 볼 수 있어요. 쓰는 쪽은 「내 쓰기가 L2까지 갔다」까지만 책임질 수 있어요.</li>
+<li><b>GPU 안에서 보이는 것과 호스트에게 보이는 것은 다른 단계예요.</b> L2에서 CU끼리는 만났지만, 메모리를 직접 읽는 호스트에게는 아직 옛값이에요. 내보내기가 한 번 더 있어야 해요.</li>
+</ol>
+
+<div class="note">장난감 규칙이에요: 캐시마다 <code>x</code> 한 줄만 있고, 줄이 저절로 교체되지 않으며, 쓰기는 쓴 CU의 L1과 L2를 함께 고치며, 호스트는 L2를 거치지 않고 메모리를 직접 읽어요. 실제 L1·L2의 쓰기 정책과 줄 교체, 호스트가 GPU 메모리를 보는 길(매핑 종류, MTYPE)은 이보다 복잡해요. 「L1끼리는 서로 알리지 않는다」「L1에 남은 옛값은 무효화나 우회 없이 치워진다는 보장이 없다」만 실제 규칙을 따랐어요.</div>
+
+<h2 id="s3">3. 깃발 신호 — 기다리기와 무효화가 짝이에요</h2>
+
+<p>2절은 버튼 사이에 시간이 멈춰 있었어요. 실제로는 쓰기가 L2에 닿기까지 시간이 걸리고, 그 시간이 주소마다 달라요. L2는 주소 범위마다 채널이 따로 있고, CU는 채널마다 요청 줄을 따로 가져요. 그래서 LLVM 문서 말대로 <b>한 CU가 차례로 보낸 두 쓰기가 다른 CU에게는 뒤바뀐 순서로 보일 수 있어요</b>.</p>
+
+<p>흔한 패턴으로 봐요. workgroup 0(CU 0)이 <code>data</code>에 42를 쓰고 <code>flag</code>에 1을 써요. workgroup 1(CU 1)은 <code>flag</code>가 1이 될 때까지 돌다가 <code>data</code>를 읽어요. OpenCL C로는 이렇게 써요. 아래는 각 workgroup에서 정해 둔 work-item <b>하나</b>가 실행하는 부분이에요. <code>data</code>와 <code>flag</code>는 global 메모리에 있고, <code>flag</code>는 0으로 초기화한 <code>atomic_int</code>이며, 다른 writer는 없다고 가정해요.</p>
+
+<div class="codepair">
+<pre class="code">// 생산자 (workgroup 0)
+data[0] = 42;
+atomic_store_explicit(&amp;flag, 1,
+    memory_order_release,
+    memory_scope_device);</pre>
+<pre class="code">// 소비자 (workgroup 1)
+while (atomic_load_explicit(&amp;flag,
+           memory_order_acquire,
+           memory_scope_device) == 0)
+    ;
+int v = data[0];</pre>
+</div>
+
+<p>컴파일러가 release와 acquire를 GFX9 명령으로 바꾼 핵심 순서가 아래 시뮬레이터의 코드예요(<code>v[data]</code> 같은 주소 표기는 실제 문법이 아닌 의사코드예요). 소비자는 flag 읽기가 끝나기를 기다린 뒤(<code>s_waitcnt vmcnt(0)</code>) 값을 보고, 무효화한 뒤 data를 읽어요. 세 스위치를 하나씩 꺼 보세요. 셋 다 켜면 42를 읽고, 하나씩 끄면 이 모델에선 저마다 다른 방식으로 틀려요.</p>
+
+<div class="sim" id="sim-flag">
+  <div class="sim-title">시뮬레이터 2 · 깃발 신호</div>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" data-k="rel" checked> <span>생산자: 깃발 쓰기 전에 기다리기 (<code>s_waitcnt vmcnt(0)</code>)</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" data-k="glc" checked> <span>소비자: 깃발은 L1을 건너뛰고 읽기 (<code>glc=1</code>)</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" data-k="acq" checked> <span>소비자: 깃발을 본 뒤 L1 무효화 (<code>buffer_wbinvl1_vol</code>)</span></label>
+  </div>
+  <div class="flagwrap">
+    <div class="prog" data-who="p"><div class="prog-name">workgroup 0 · CU 0 (생산자)</div><ol></ol></div>
+    <div class="prog" data-who="c"><div class="prog-name">workgroup 1 · CU 1 (소비자)</div><ol></ol></div>
+  </div>
+  <div class="memrow">
+    <div class="mcol"><div class="mname">가는 중 (L2로)</div><div class="mbody" data-m="fly"></div></div>
+    <div class="mcol"><div class="mname">L2</div><div class="mbody" data-m="l2"></div></div>
+    <div class="mcol"><div class="mname">CU 1 · L1</div><div class="mbody" data-m="l1"></div></div>
+  </div>
+  <div class="controls">
+    <button data-act="play" class="primary">흘려 보기</button>
+    <button data-act="tick">한 박자</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="say"></div>
+  <div class="log"></div>
+</div>
+
+<p>하나씩 끈 결과는 이래요.</p>
+<ul>
+<li><b>기다리기를 끄면</b> <code>flag</code>가 <code>data</code>보다 먼저 L2에 닿아요. 소비자는 깃발을 보고 L2에서 <code>data</code>를 읽지만, 42는 아직 오는 중이에요. release는 「앞의 쓰기가 다 끝난 뒤에 깃발을 올린다」는 약속이고, GFX9에선 그게 <code>s_waitcnt vmcnt(0)</code> 한 줄이에요.</li>
+<li><b>무효화를 끄면</b> 깃발은 제대로 봤는데, <code>data</code>를 읽을 때 L1에 남은 옛값 0을 그대로 받아요. 2절과 같은 일이에요. 이 예시에서 소비자의 acquire가 생산자의 release가 쓴 flag = 1을 읽으면, release 전에 쓴 data = 42가 acquire 뒤의 data 읽기에 보이도록 이어져요. GFX9에선 그 acquire가 <code>glc</code> 읽기, 완료 대기, <code>buffer_wbinvl1_vol</code>이에요.</li>
+<li><b>glc를 끄면</b> 깃발 자체를 L1에서 읽어요. 처음 읽은 0이 L1에 남고, 그 뒤로는 L2의 깃발이 1이 되어도 L1의 0만 봐요. 실제로는 캐시 줄이 교체되면 풀릴 수도 있지만, 언제 풀릴지는 아무도 보장하지 않아요. 시뮬레이터는 줄이 교체되지 않는다고 두고, 일정 횟수 뒤에 멈춰요.</li>
+</ul>
+
+<p>이 스위치들은 저수준 동작을 하나씩 빼 보는 실험이에요. OpenCL 코드에서 필요한 동기화를 빼면 data race가 되어서, 언어 차원에선 「반드시 0」 같은 결과도 보장되지 않아요. 위 결과는 이 모델에서 일어날 수 있는 실패 하나씩이에요.</p>
+
+<p>이 데이터 전달에선 생산자의 release와, 그 신호를 읽는 소비자의 acquire가 <b>함께</b> 필요하다는 게 이 시뮬레이터의 요점이에요. 생산자 쪽만 고쳐서는 소비자의 L1을 못 건드리고, 소비자 쪽만 고쳐서는 생산자의 쓰기 순서를 못 바꿔요(release fence와 acquire atomic처럼 다른 조합도 있어요). RDNA에선 이름이 바뀌어요. 무효화는 <code>buffer_gl0_inv</code>와 <code>buffer_gl1_inv</code> 둘이고(L0과 GL1), 쓰기의 완료를 기다리는 카운터는 <code>vscnt</code>로 따로 세요. 또 RDNA의 WGP 모드에선 같은 workgroup의 wave도 서로 다른 CU의 L0을 쓸 수 있어서, workgroup 안에서도 <code>buffer_gl0_inv</code>가 필요해요.</p>
+
+<div class="note">이 시뮬레이터는 두 workgroup이 <b>둘 다 CU에 앉아 있다</b>고 가정해요. 3장 4절에서 봤듯이, 같은 dispatch 안의 workgroup끼리 기다리는 코드는 상대가 아직 앉지 못하면 메모리 순서와 상관없이 멈출 수 있어요. 그래서 실제 코드에선 이 패턴보다 dispatch를 나누는 쪽(다음 절)을 먼저 써요. 박자 수(<code>data</code> 쪽 5박자, <code>flag</code> 쪽 1박자), 「소비자 L1에 예전 <code>data</code>가 남아 있다」는 출발점, 읽기와 그 완료 대기를 한 박자로 친 것, 「멈췄다」로 보는 횟수는 지어낸 값이에요.</div>
+
+<h2 id="s4">4. 커널 사이와 호스트 앞에서는 드라이버가 해요</h2>
+
+<p>3절처럼 커널 안에서 workgroup끼리 신호를 주고받는 일은 드물어요. 대부분은 <b>dispatch A가 쓰고, 끝나면 dispatch B가 읽고, 다 끝나면 호스트가 읽어요</b>. 이 경계에선 커널 코드가 아니라 드라이버가 패킷으로 같은 일을 해요. 1장 시뮬레이터 3의 「A와 B 사이 barrier」에 빠져 있던 반쪽이 이거예요.</p>
+
+<table class="tbl">
+<thead><tr><th>누가 누구에게</th><th>필요한 것</th><th>AMD에서의 모양 (GFX9 · RDNA)</th></tr></thead>
+<tbody>
+<tr><td>같은 wave의 레인끼리</td><td>추가 캐시 무효화는 불필요</td><td>같은 L1(L0)을 씀. 실행 순서·메모리 완료 대기는 별개</td></tr>
+<tr><td>같은 workgroup의 wave끼리 (global 메모리)</td><td><code>barrier(CLK_GLOBAL_MEM_FENCE)</code> 같은 동기화</td><td>GFX9: 같은 CU라 L1을 같이 씀 → 추가 무효화 없이 컴파일러가 완료 대기와 <code>s_barrier</code>를 넣음. RDNA WGP 모드: 다른 CU의 L0일 수 있어 <code>buffer_gl0_inv</code>도 (LDS만 주고받을 땐 해당 없음)</td></tr>
+<tr><td>같은 dispatch의 다른 workgroup</td><td>release · acquire (3절)</td><td>쓰는 쪽 <code>s_waitcnt vmcnt(0)</code>, 읽는 쪽 <code>glc</code> 읽기 + <code>s_waitcnt vmcnt(0)</code> + <code>buffer_wbinvl1_vol</code> · RDNA는 쓰기 완료를 <code>vscnt</code>로 기다리고, 무효화는 <code>buffer_gl0_inv</code>·<code>buffer_gl1_inv</code></td></tr>
+<tr><td>dispatch A → dispatch B</td><td>API의 실행·메모리 의존성. 이 장의 AMD 캐시 읽기 경로에선 A를 기다리고, B가 쓸 캐시의 옛값을 치움</td><td><code>CS_PARTIAL_FLUSH</code> 이벤트 + <code>ACQUIRE_MEM</code>. 비트는 GFX9 <code>CP_COHER_CNTL</code>의 <code>TCL1_ACTION_ENA</code>(벡터 L1)·<code>SH_KCACHE_ACTION_ENA</code>(스칼라), RDNA <code>GCR_CNTL</code>의 <code>GLV_INV</code>·<code>GLK_INV</code>·<code>GL1_INV</code></td></tr>
+<tr><td>GPU → 호스트</td><td>device 쓰기 → <code>HOST_READ</code> 메모리 의존성 → 완료 대기 → (non-coherent면) invalidate → 읽기</td><td>GFX9의 amdgpu 링 fence 패킷 <code>RELEASE_MEM</code>에 <code>TC_WB_ACTION</code>(L2 내보내기) 비트가 같이 실림. 호스트 쪽 매핑이 non-coherent면 앱이 <code>vkInvalidateMappedMemoryRanges</code></td></tr>
+</tbody>
+</table>
+
+<p>몇 가지를 짚어요.</p>
+<ul>
+<li><b>이 장의 캐시 읽기 경로에선 dispatch 사이에 L1의 옛값을 치워요.</b> Vulkan이 약속하는 건 특정 캐시 명령이 아니라 실행·메모리 의존성이고, 실제 패킷과 대상 캐시는 세대·접근 종류·드라이버마다 달라요. GPU의 CU끼리는 L2를 함께 쓰니, B 쪽 CU의 L1(L0, GL1)에 든 옛값을 치우는 게 핵심이에요. LLVM 문서는 ROCm 경로에서 CP가 dispatch 사이에 벡터·스칼라 캐시를 무효화한다고 적어요(이걸 Vulkan의 모든 dispatch 경계로 넓히진 않아요).</li>
+<li><b>radv는 경우를 나눠요.</b> shader-storage 버퍼 쓰기 쪽 분기(<code>radv_src_access_flush</code>)는 L2 내보내기·무효화(<code>AC_BARRIER_INV_L2</code>)를 요청해요. 읽기 쪽(<code>radv_dst_access_flush</code>)에는 GPU 세대와 non-coherent render backend 상태에 따라 버퍼의 L2 처리를 건너뛰는 최적화(<code>can_skip_buffer_l2_flushes</code>)가 있어요. 그래서 모든 버퍼 배리어가 늘 L2를 비운다는 뜻은 아니에요.</li>
+<li><b>fence 하나가 두 일을 해요.</b> 1장의 fence는 「숫자 N을 쓴다」였어요. 리눅스 amdgpu의 GFX9 fence 코드(<code>gfx_v9_0_ring_emit_fence</code>)를 보면, 그 숫자를 쓰는 <code>RELEASE_MEM</code> 패킷에 L2 내보내기 비트가 함께 실려요. 이 구현은 완료 신호와 L2 내보내기 요청을 한 패킷에 같이 기록하는 거예요. 그렇다고 Vulkan 앱이 fence만 기다리면 호스트 가시성이 생긴다는 약속은 아니에요. 사양은 fence를 기다려도 메모리 접근의 결과가 호스트에게 보인다는 보장은 없다고 적어요. 앱은 device 쓰기 → <code>HOST_READ</code> 메모리 의존성을 따로 걸어야 해요. 블로그의 「EVENT_WRITE는 신호탄이고, 가시성은 FLUSH/INVALIDATE가 만든다」가 이 둘을 갈라 본 글이에요.</li>
+<li><b>호스트 쪽 캐시는 또 다른 이야기예요.</b> CPU가 매핑한 메모리가 <code>HOST_COHERENT</code>가 아니면, GPU 결과를 읽기 전엔 <code>vkInvalidateMappedMemoryRanges</code>, CPU가 쓰고 나서 GPU에 넘기기 전엔 <code>vkFlushMappedMemoryRanges</code>가 앱의 몫이에요. 블로그 11-23 오답노트는 뒤쪽, 곧 호스트→GPU 방향의 flush를 다뤄요.</li>
+</ul>
+
+<p>대체로 동기화 범위가 넓고 정리할 캐시가 클수록 비용이 늘 수 있어요. 다만 실제 비용은 기다릴 작업, 캐시 상태, 메모리 일관성 경로, 드라이버가 고른 동작에 따라 달라서 표의 순서가 곧 비용 순위는 아니에요. 블로그의 배리어 글이 말하듯, stage와 access를 필요 이상으로 넓히면 불필요한 flush가 따라와 느려질 수 있어요.</p>
+
+<h2 id="s5">5. 손으로 만들어 보기</h2>
+
+<p><a href="https://jayinlab.github.io/nand-game/">NAND 게임</a> 6부(메모리)는 이 장의 바로 앞 단계예요. 「같은 줄인가」「늦게 오는 읽기」로 메모리 읽기에 시간이 걸린다는 걸 겪고, 「원자 덧셈」「배리어」로 여럿이 같은 곳을 만질 때의 순서를 손으로 맞춰요. 8부 「캐시 비우기」에선 지난번 옛값이 남은 캐시를 <code>ACQUIRE_MEM</code>으로 무효화하고 나서 dispatch를 내려요. 이 장 4절의 dispatch 사이 줄을 패킷 한 장으로 직접 써 보는 자리예요.</p>
+
+<h2>핵심 정리</h2>
+<div class="summary">
+<ul>
+<li>캐시는 층마다 나눠 쓰는 범위가 달라요. 벡터 L1(L0)은 CU 하나, L2는 GPU 전체예요. 두 쓰레드는 함께 쓰는 층에서야 같은 값을 봐요.</li>
+<li>L1끼리는 서로 알리지 않아요. 예전 값이 L1에 남아 있으면 보통의 캐시 읽기는 옛값을 받을 수 있어서, 이 장에선 읽는 쪽이 자기 L1을 무효화해요(L1을 건너뛰는 <code>glc</code> 읽기도 있어요).</li>
+<li>한 CU가 보낸 쓰기 둘은 L2 채널이 달라서 다른 CU에게 뒤바뀐 순서로 보일 수 있어요. 이 데이터 전달에선 생산자의 release(쓰는 쪽 기다리기)와 그 신호를 읽는 소비자의 acquire(완료 대기 + 무효화)가 함께 필요해요.</li>
+<li>dispatch 사이에선 API의 의존성을 드라이버가 <code>CS_PARTIAL_FLUSH</code> + <code>ACQUIRE_MEM</code> 같은 패킷으로 지켜요. GFX9의 amdgpu 링 fence <code>RELEASE_MEM</code>은 L2 내보내기도 같이 요청해요.</li>
+<li>호스트가 결과를 읽으려면 device 쓰기 → <code>HOST_READ</code> 의존성, 완료 대기, non-coherent 매핑이면 invalidate까지가 앱의 몫이에요.</li>
+</ul>
+</div>
+
+<h2>확인 퀴즈</h2>
+<div id="quiz"></div>
+
+<h2>더 읽기</h2>
+<p>블로그에서 이 장의 가시성을 다른 각도로 다룬 글이에요.</p>
+<ul>
+<li><a href="https://jayinlab.github.io/opencl-note-pm4-event-write-vs-cache-flush/">PM4 EVENT_WRITE는 신호탄이고, 가시성은 FLUSH/INVALIDATE가 만든다</a> — 4절의 「fence 하나가 두 일」</li>
+<li><a href="https://jayinlab.github.io/vulkan-pipeline-barrier/">vkCmdPipelineBarrier 깊이 파기</a> — dispatch 사이 배리어가 캐시 동작으로 내려가는 길</li>
+<li><a href="https://jayinlab.github.io/vulkan-host-write-flush-is-not-gpu-completion/">GPU가 끝났는데 왜 새 데이터가 안 보일까</a> — 반대 방향(호스트→GPU)에서 완료 대기와 flush가 다른 약속이라는 것</li>
+<li><a href="https://jayinlab.github.io/opencl-nonblocking-write-in-order-buffer-visibility/">비동기 write가 반환됐는데, 다음 kernel은 어느 weights를 읽을까</a> — OpenCL 쪽에서 본 가시성</li>
+</ul>
+
+<h2>여기까지가 사실, 여기부터가 단순화</h2>
+<p><b>공개 자료로 확인한 것.</b> 캐시 층과 나눠 쓰는 범위(GFX9의 CU당 vector L1, CU 몇 개가 쓰는 scalar L1, CU 전부가 쓰는 L2와 채널; GFX10·11의 CU당 vector L0, WGP당 scalar L0, shader array당 GL1), LDS에 캐시가 끼지 않는다는 것, 다른 CU의 쓰기가 뒤바뀐 순서로 보일 수 있다는 것, 그리고 release(<code>s_waitcnt vmcnt(0)</code> 뒤 store)와 acquire(<code>glc=1</code> load, <code>s_waitcnt vmcnt(0)</code>, <code>buffer_wbinvl1_vol</code>)의 GFX9 순서, RDNA의 <code>buffer_gl0_inv</code>·<code>buffer_gl1_inv</code>와 WGP 모드의 workgroup 안 무효화는 LLVM AMDGPU 문서(AMDGPUUsage)의 「Memory Model GFX6-GFX9」「Memory Model GFX10-GFX11」 절과 코드 순서 표를 따랐어요. ROCm 경로에서 CP가 dispatch마다 캐시를 무효화한다는 것도 같은 문서예요. <code>ACQUIRE_MEM</code>(0x58)·<code>RELEASE_MEM</code>(0x49), <code>CP_COHER_CNTL</code>의 <code>TCL1_ACTION_ENA</code>·<code>SH_KCACHE_ACTION_ENA</code>·<code>TC_ACTION_ENA</code>·<code>TC_WB_ACTION_ENA</code>, <code>GCR_CNTL</code>의 <code>GLV_INV</code>·<code>GLK_INV</code>·<code>GL1_INV</code>·<code>GL2_INV</code>·<code>GL2_WB</code>, <code>CS_PARTIAL_FLUSH</code>는 Mesa <code>src/amd/common/sid.h</code>·<code>ac_barrier.c</code>를, radv가 버퍼 쓰기 쪽에 <code>AC_BARRIER_INV_L2</code>를 요청하는 분기와 읽기 쪽의 <code>can_skip_buffer_l2_flushes</code> 최적화는 <code>radv_cmd_buffer.c</code>의 <code>radv_src_access_flush</code>·<code>radv_dst_access_flush</code>를(2026-11 main 기준), fence 패킷의 L2 내보내기 비트는 리눅스 <code>drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c</code>의 <code>gfx_v9_0_ring_emit_fence</code>를 따랐어요. fence 대기만으로는 호스트 가시성이 보장되지 않는다는 것과 호스트 매핑의 flush·invalidate는 Vulkan 사양의 synchronization·memory 장을, OpenCL 예시의 atomic·scope와 data race 규칙은 OpenCL C 사양과 실행 모델을 따랐어요.</p>
+<p><b>모델의 가정.</b> 시뮬레이터 1은 캐시마다 줄 하나, 주소 하나만 두었고, 줄이 저절로 교체되지 않아요. 시뮬레이터 1에서 쓰기가 쓴 CU의 L1과 L2를 함께 고친다는 것, 호스트가 L2를 거치지 않고 메모리를 읽는다는 것은 단순화예요. 실제 L1·L2의 쓰기 정책, 줄 교체, 메모리 종류(MTYPE)에 따라 L2를 건너뛰거나 CPU와 일관성을 맞추는 경로는 다루지 않았어요. 시뮬레이터 2의 박자 수, 읽기가 한 박자에 끝난다는 것, 소비자 L1에 예전 <code>data</code>가 남아 있다는 출발점, 줄 교체나 다른 무효화가 없다는 것, 두 workgroup이 함께 앉아 있다는 것, flag가 L2에 닿은 뒤 10박자를 더 돌면 「멈췄다」로 보는 기준은 지어낸 조건이에요. 스위치는 저수준 동작을 빼 보는 실험이지, 올바른 OpenCL 코드가 내는 결과의 보장이 아니에요. 표시한 명령은 핵심 순서만 보인 의사코드예요. gfx90a·gfx942처럼 L2가 여럿이거나 다른 규칙을 쓰는 세대, GFX12의 새 캐시 명령은 다루지 않았어요.</p>
+
+<footer>
+<p>1판 · 2026-11-24 · Claude가 쓰고 OCL(GPT)이 사실 검토한 글이에요. 틀린 곳을 찾으면 리포 이슈로 알려 주세요.</p>
+</footer>
+
+</main>
+<script src="../assets/map.js"></script>
+<script src="../assets/ch04.js"></script>
+</body>
+</html>

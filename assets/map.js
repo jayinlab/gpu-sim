@@ -64,6 +64,13 @@ const CHAPTERS = [
     touch: ['cp', 'umd', 'vk'],
     at: { vk: 's1', umd: 's1', cp: 's1', disp: 's2', cu: 's2', regs: 's3' },
   },
+  {
+    id: 'ch04', no: '04', status: 'published', color: 'var(--c4)',
+    title: '캐시와 메모리 — 썼다고 다 보이는 건 아니에요', href: 'ch04/',
+    main: ['cache'],
+    touch: ['cu', 'regs', 'cp', 'fence', 'wait', 'umd'],
+    at: { cache: 's1', regs: 's1', cu: 's2', umd: 's4', cp: 's4', fence: 's4', wait: 's4' },
+  },
 ];
 
 const NS = 'http://www.w3.org/2000/svg';

@@ -16,6 +16,7 @@
   --c1: #2f6fdb;
   --c2: #8a4fd8;
   --c3: #12897a;
+  --c4: #c0561b;
   --wg-l: 52%;
   --on-c: #ffffff;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -39,6 +40,7 @@
     --c1: #7aa7ff;
     --c2: #c09bff;
     --c3: #4fd1bd;
+    --c4: #ff9e64;
     --wg-l: 62%;
     --on-c: #10131a;
   }
@@ -310,4 +312,43 @@ select[data-k="gpu"], select[data-k="mask"] { width: auto; }
 @media (max-width: 560px) {
   .ses, .ses.many { grid-template-columns: 1fr; }
   .vgrid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+}
+
+/* 4장 · 캐시와 메모리 */
+.codepair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 1em 0 1.4em; }
+pre.code { margin: 0; font: .8rem/1.6 var(--mono); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; overflow-x: auto; }
+.coh { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.cbox { border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); padding: 8px 10px; transition: background-color .25s, border-color .25s; }
+.cbox.wide { grid-column: 1 / -1; }
+.cname { font-size: .72rem; font-weight: 700; color: var(--ink-2); }
+.cval { font: 700 1.15rem/1.5 var(--mono); }
+.cstate { font-size: .78rem; color: var(--ink-2); min-height: 1.4em; }
+.cbtns { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.cbtns button { padding: 3px 9px; font-size: .8rem; }
+.cbox.fresh { border-color: var(--ok); background: var(--ok-soft); }
+.cbox.stale { border-color: var(--bad); background: var(--bad-soft); }
+.cbox.dirty { border-color: var(--warn); background: var(--warn-soft); }
+.cbox.empty .cval { color: var(--ink-2); font-weight: 400; }
+.say.bad { box-shadow: inset 3px 0 0 var(--bad); }
+.say.good { box-shadow: inset 3px 0 0 var(--ok); }
+.flagwrap { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.prog { border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); padding: 8px 10px; min-width: 0; }
+.prog-name { font-size: .72rem; font-weight: 700; color: var(--ink-2); margin-bottom: 4px; }
+.prog ol { list-style: none; margin: 0; padding: 0; }
+.prog li { font-size: .78rem; padding: 3px 6px; border-radius: 6px; border-left: 3px solid transparent; overflow-wrap: anywhere; }
+.prog li code { background: none; padding: 0; font-size: .95em; }
+.prog li.cur { background: color-mix(in srgb, var(--c4) 14%, var(--surface)); border-left-color: var(--c4); }
+.prog li.past { opacity: .6; }
+.prog li.off { opacity: .45; text-decoration: line-through; }
+.prog .tag { display: inline-block; margin-left: 6px; font-size: .68rem; padding: 0 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-2); }
+.prog .tag.warn { border-color: var(--warn); background: var(--warn-soft); color: var(--ink); }
+.memrow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+.mcol { border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; background: var(--surface); min-width: 0; }
+.mname { font-size: .72rem; font-weight: 700; color: var(--ink-2); margin-bottom: 4px; }
+.mbody { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; min-height: 2.4em; }
+.mbody .memcell { font-size: .76rem; padding: 2px 8px; }
+.memcell.fly { border-color: var(--warn); background: var(--warn-soft); }
+.memcell.old { border-color: var(--bad); background: var(--bad-soft); }
+@media (max-width: 560px) {
+  .codepair, .flagwrap, .memrow { grid-template-columns: 1fr; }
 }
