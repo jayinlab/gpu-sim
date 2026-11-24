@@ -1,9 +1,11 @@
-/* GPU Sim 탐색 지도 — 메인은 전체 지도, 장마다 그 장이 다룬 칸만 색칠한다.
-   장을 더할 땐 CHAPTERS에 한 줄, 새 칸이 필요하면 NODES·EDGES에 더한다. */
+/* GPU Sim 탐색 지도 — 부마다 지도 하나(MAPS), 메인은 부의 전체 지도, 장마다 그 장이 다룬 칸만 색칠한다.
+   장을 더할 땐 CHAPTERS에 한 줄(map = 어느 부의 지도), 새 칸이 필요하면 그 지도의 nodes·edges에 더한다.
+   1부 = 명령이 흐르는 길, 2부 = 버퍼의 일생(2026-11-24 재희: 2부 전용 지도, 통합 지도는 추후 따로). */
 (() => {
 'use strict';
 
 const W = 120, H = 48;
+/* ---------- 1부 · 명령이 흐르는 길 ---------- */
 const NODES = [
   { id: 'app',      x: 20,  y: 36,  t: '앱',               s: 'OpenCL API' },
   { id: 'angle',    x: 160, y: 36,  t: 'ANGLE · CL',       s: 'OpenCL → Vulkan' },
@@ -39,11 +41,66 @@ const BANDS = [
   { t: '경계',         y: 300, h: 104 },
   { t: 'GPU',          y: 420, h: 290 },
 ];
+function extrasP1(svg) {
+  // 컴파일러와 명령 기록은 둘 다 Vulkan 드라이버(UMD) 안의 일이라 한 테두리로 묶는다
+  mk('rect', { x: 151, y: 118, width: 278, height: 72, rx: 13, class: 'gmap-group' }, svg);
+  mk('text', { x: 290, y: 114, class: 'gmap-group-t' }, svg).textContent = 'Vulkan 드라이버';
+}
+function labelsP1(svg) {
+  // 점선 두 개는 뜻을 칸 옆에 적는다
+  mk('text', { x: 226, y: 298, class: 'gmap-elabel' }, svg).textContent = 'IB를 따라감';
+  mk('text', { x: 506, y: 300, class: 'gmap-elabel' }, svg).textContent = '완료 관찰';
+  mk('text', { x: 24, y: 124, class: 'gmap-elabel' }, svg).textContent = 'compile chain';
+  mk('text', { x: 286, y: 214, class: 'gmap-elabel' }, svg).textContent = '기록';
+  mk('text', { x: 366, y: 214, class: 'gmap-elabel' }, svg).textContent = '제출';
+}
+
+/* ---------- 2부 · 버퍼의 일생 ---------- */
+const NODES2 = [
+  { id: 'app',    x: 20,  y: 36,  t: 'cl_mem',          s: 'clCreateBuffer' },
+  { id: 'angle',  x: 160, y: 36,  t: 'ANGLE · CL',      s: 'VkBuffer + 메모리' },
+  { id: 'vkmem',  x: 300, y: 36,  t: 'Vulkan 메모리',    s: 'memory type 고르기' },
+  { id: 'map',    x: 440, y: 36,  t: 'CPU 매핑',         s: 'map · 호스트 포인터' },
+  { id: 'va',     x: 160, y: 126, t: 'GPU 주소',         s: 'VA 범위 고르기' },
+  { id: 'radvbo', x: 300, y: 126, t: 'radv BO',          s: 'domain · flags' },
+  { id: 'gpuvm',  x: 160, y: 240, t: 'GPU VM',           s: 'GEM_VA · 페이지 표' },
+  { id: 'gem',    x: 300, y: 240, t: 'GEM 핸들',         s: 'GEM_CREATE' },
+  { id: 'resv',   x: 440, y: 240, t: 'fence · 해제',     s: 'dma_resv · 지연 해제' },
+  { id: 'resid',  x: 160, y: 330, t: 'residency',        s: '제출 때 자리 확인' },
+  { id: 'ttm',    x: 300, y: 330, t: 'TTM BO',           s: '자리 잡기 · 옮기기' },
+  { id: 'vram',   x: 20,  y: 456, t: 'VRAM',             s: 'CPU가 못 보는 쪽' },
+  { id: 'vis',    x: 160, y: 456, t: '보이는 VRAM',       s: 'CPU BAR 창' },
+  { id: 'gtt',    x: 300, y: 456, t: 'GTT',              s: '시스템 RAM · GPU가 봄' },
+  { id: 'sys',    x: 440, y: 456, t: 'SYSTEM',           s: '밀려난 페이지' },
+];
+const EDGES2 = [
+  ['app', 'angle'], ['angle', 'vkmem'], ['vkmem', 'radvbo'],
+  ['radvbo', 'va'], ['va', 'gpuvm'], ['radvbo', 'gem'],
+  ['map', 'gem', 'jump'], ['gem', 'ttm'], ['resid', 'ttm'], ['resv', 'ttm', 'jump'],
+  ['ttm', 'vram'], ['ttm', 'vis'], ['ttm', 'gtt'],
+  ['gtt', 'sys', 'back'],
+];
+const BANDS2 = [
+  { t: '사용자 공간 (앱 · ANGLE · radv)', y: 8,   h: 190 },
+  { t: '커널 드라이버 (amdgpu · TTM)',     y: 212, h: 196 },
+  { t: '놓이는 곳',                        y: 422, h: 110 },
+];
+function labelsP2(svg) {
+  mk('text', { x: 222, y: 230, class: 'gmap-elabel' }, svg).textContent = 'GEM_VA';
+  mk('text', { x: 366, y: 230, class: 'gmap-elabel' }, svg).textContent = 'GEM_CREATE';
+  mk('text', { x: 444, y: 160, class: 'gmap-elabel' }, svg).textContent = 'mmap';
+  mk('text', { x: 432, y: 448, class: 'gmap-elabel' }, svg).textContent = '밀려남';
+}
+
+const MAPS = {
+  p1: { nodes: NODES, edges: EDGES, bands: BANDS, vh: 720, extras: extrasP1, labels: labelsP1, aria: 'GPU 탐색 지도 · 1부 명령이 흐르는 길' },
+  p2: { nodes: NODES2, edges: EDGES2, bands: BANDS2, vh: 540, extras: () => {}, labels: labelsP2, aria: 'GPU 탐색 지도 · 2부 버퍼의 일생' },
+};
 
 // main = 주로 다룬 칸, touch = 스쳐 간 칸, at = 칸을 누르면 갈 절
 const CHAPTERS = [
   {
-    id: 'ch01', no: '01', status: 'published', color: 'var(--c1)',
+    id: 'ch01', no: '01', map: 'p1', status: 'published', color: 'var(--c1)',
     title: '커맨드가 Queue를 거쳐 CU에 닿기까지', href: 'ch01/',
     main: ['ib', 'kmd', 'ring', 'doorbell', 'cp', 'fence', 'cu'],
     touch: ['app', 'umd', 'wait', 'disp', 'cache', 'regs'],
@@ -51,44 +108,73 @@ const CHAPTERS = [
           disp: 's4', cu: 's4', regs: 's4', fence: 's5', wait: 's5', cache: 's5' },
   },
   {
-    id: 'ch02', no: '02', status: 'published', color: 'var(--c2)',
+    id: 'ch02', no: '02', map: 'p1', status: 'published', color: 'var(--c2)',
     title: 'Queue — 넣기·보내기·알리기는 다른 시점', href: 'ch02/',
     main: ['app', 'angle', 'vk', 'umd', 'kmd'],
     touch: ['wait', 'ib', 'ring', 'doorbell'],
     at: { app: 's1', angle: 's2', vk: 's2', umd: 's2', kmd: 's2', ib: 's2', ring: 's2', doorbell: 's2', wait: 's3' },
   },
   {
-    id: 'ch03', no: '03', status: 'published', color: 'var(--c3)',
+    id: 'ch03', no: '03', map: 'p1', status: 'published', color: 'var(--c3)',
     title: '디스패처 — 패킷 하나가 wave 수천 개로', href: 'ch03/',
     main: ['disp', 'cu', 'regs'],
     touch: ['cp', 'umd', 'vk'],
     at: { vk: 's1', umd: 's1', cp: 's1', disp: 's2', cu: 's2', regs: 's3' },
   },
   {
-    id: 'ch04', no: '04', status: 'published', color: 'var(--c4)',
+    id: 'ch04', no: '04', map: 'p1', status: 'published', color: 'var(--c4)',
     title: '캐시와 메모리 — 썼다고 다 보이는 건 아니에요', href: 'ch04/',
     main: ['cache'],
     touch: ['cu', 'regs', 'cp', 'fence', 'wait', 'umd'],
     at: { cache: 's1', regs: 's1', cu: 's2', umd: 's4', cp: 's4', fence: 's4', wait: 's4' },
   },
   {
-    id: 'ch05', no: '05', status: 'published', color: 'var(--c5)',
+    id: 'ch05', no: '05', map: 'p1', status: 'published', color: 'var(--c5)',
     title: '컴파일러 — 커널은 두 번 번역돼요', href: 'ch05/',
     main: ['clspv', 'compiler'],
     touch: ['app', 'angle', 'vk', 'regs', 'disp'],
     at: { app: 's1', angle: 's1', vk: 's1', clspv: 's2', compiler: 's3', regs: 's4', disp: 's4' },
   },
   {
-    id: 'ch06', no: '06', status: 'published', color: 'var(--c6)',
+    id: 'ch06', no: '06', map: 'p1', status: 'published', color: 'var(--c6)',
     title: '완료 대기 — 「끝났다」는 누가 알아채나요', href: 'ch06/',
     main: ['wait'],
     touch: ['app', 'angle', 'vk', 'kmd', 'cp', 'fence'],
     at: { fence: 's1', cp: 's2', kmd: 's2', vk: 's2', wait: 's3', angle: 's3', app: 's4' },
   },
+  // 2부 — 순서는 2026-11-24 재희와 정함. planned는 제목·칸이 바뀔 수 있다
+  {
+    id: 'ch07', no: '07', map: 'p2', status: 'published', color: 'var(--c7)',
+    title: 'BO와 자리 — 버퍼는 어디에 놓이나요', href: 'ch07/',
+    main: ['vkmem', 'radvbo', 'gem', 'ttm', 'vram', 'vis', 'gtt'],
+    touch: ['app', 'angle', 'va', 'map', 'sys'],
+    at: { app: 's1', angle: 's2', vkmem: 's2', map: 's2', radvbo: 's3', va: 's3', gem: 's4', ttm: 's4',
+          vram: 's5', vis: 's4', gtt: 's5', sys: 's5' },
+  },
+  {
+    id: 'ch08', no: '08', map: 'p2', status: 'planned', color: 'var(--c8)',
+    title: 'GPU VM — 주소와 페이지 표', href: null,
+    main: ['va', 'gpuvm'], touch: ['radvbo', 'ttm', 'vram', 'gtt'], at: {},
+  },
+  {
+    id: 'ch09', no: '09', map: 'p2', status: 'planned', color: 'var(--c9)',
+    title: 'residency — 제출할 때 다시 자리 잡기', href: null,
+    main: ['resid', 'sys'], touch: ['ttm', 'vram', 'gtt'], at: {},
+  },
+  {
+    id: 'ch10', no: '10', map: 'p2', status: 'planned', color: 'var(--c10)',
+    title: '해제와 fence — 지워도 바로 사라지진 않아요', href: null,
+    main: ['resv'], touch: ['gem', 'ttm'], at: {},
+  },
+  {
+    id: 'ch11', no: '11', map: 'p2', status: 'planned', color: 'var(--c11)',
+    title: '호스트와 나누기 — 매핑과 호스트 포인터', href: null,
+    main: ['map'], touch: ['vis', 'gtt', 'vkmem'], at: {},
+  },
 ];
 
 const NS = 'http://www.w3.org/2000/svg';
-const node = id => NODES.find(n => n.id === id);
+const nodeIn = (M, id) => M.nodes.find(n => n.id === id);
 const mk = (tag, attrs, parent) => {
   const e = document.createElementNS(NS, tag);
   for (const k in attrs) e.setAttribute(k, attrs[k]);
@@ -104,24 +190,22 @@ function exit(n, tx, ty) {
 }
 const center = n => [n.x + W / 2, n.y + H / 2];
 
-function draw(svg) {
-  svg.setAttribute('viewBox', '0 0 580 720');
+function draw(svg, M) {
+  svg.setAttribute('viewBox', '0 0 580 ' + M.vh);
   svg.setAttribute('class', 'gmap');
   const defs = mk('defs', {}, svg);
   const m = mk('marker', { id: svg.id + '-arw', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' }, defs);
   mk('path', { d: 'M0,0 L10,5 L0,10 z', class: 'gmap-arw' }, m);
 
-  BANDS.forEach(b => {
+  M.bands.forEach(b => {
     mk('rect', { x: 4, y: b.y, width: 572, height: b.h, rx: 14, class: 'gmap-band' }, svg);
     mk('text', { x: 16, y: b.y + 18, class: 'gmap-band-t' }, svg).textContent = b.t;
   });
-  // 컴파일러와 명령 기록은 둘 다 Vulkan 드라이버(UMD) 안의 일이라 한 테두리로 묶는다
-  mk('rect', { x: 151, y: 118, width: 278, height: 72, rx: 13, class: 'gmap-group' }, svg);
-  mk('text', { x: 290, y: 114, class: 'gmap-group-t' }, svg).textContent = 'Vulkan 드라이버';
+  M.extras(svg);
 
   // 노드 상자는 y+6에 그려지므로 선도 6 내려 그린다
-  EDGES.forEach(([f, t, kind, via]) => {
-    const a = node(f), b = node(t);
+  M.edges.forEach(([f, t, kind, via]) => {
+    const a = nodeIn(M, f), b = nodeIn(M, t);
     const [ax, ay] = via ? exit(a, via[0], via[1]) : exit(a, ...center(b));
     const [bx, by] = via ? exit(b, via[0], via[1]) : exit(b, ...center(a));
     const d = via ? `M${ax},${ay + 6} Q${via[0]},${via[1] + 6} ${bx},${by + 6}` : `M${ax},${ay + 6} L${bx},${by + 6}`;
@@ -129,19 +213,14 @@ function draw(svg) {
   });
 
   const g = {};
-  NODES.forEach(n => {
+  M.nodes.forEach(n => {
     const a = mk('a', { class: 'gmap-node', 'data-id': n.id, tabindex: 0, role: 'button', 'aria-label': n.t }, svg);
     mk('rect', { x: n.x, y: n.y + 6, width: W, height: H, rx: 10 }, a);
     mk('text', { x: n.x + W / 2, y: n.y + 26, class: 'gmap-t' }, a).textContent = n.t;
     mk('text', { x: n.x + W / 2, y: n.y + 42, class: 'gmap-s' }, a).textContent = n.s;
     g[n.id] = a;
   });
-  // 점선 두 개는 뜻을 칸 옆에 적는다
-  mk('text', { x: 226, y: 298, class: 'gmap-elabel' }, svg).textContent = 'IB를 따라감';
-  mk('text', { x: 506, y: 300, class: 'gmap-elabel' }, svg).textContent = '완료 관찰';
-  mk('text', { x: 24, y: 124, class: 'gmap-elabel' }, svg).textContent = 'compile chain';
-  mk('text', { x: 286, y: 214, class: 'gmap-elabel' }, svg).textContent = '기록';
-  mk('text', { x: 366, y: 214, class: 'gmap-elabel' }, svg).textContent = '제출';
+  M.labels(svg);
   return g;
 }
 
@@ -162,8 +241,8 @@ function paint(g, svg, ch, mode) {
 }
 
 // 메인: 칸마다 처음 「주로」 다룬 공개 장의 색, 아무도 안 다룬 칸은 빈 땅
-function paintOverview(g, svg) {
-  const pub = CHAPTERS.filter(c => c.status === 'published');
+function paintOverview(g, svg, mapId) {
+  const pub = CHAPTERS.filter(c => c.status === 'published' && c.map === mapId);
   Object.entries(g).forEach(([id, a]) => {
     a.classList.remove('main', 'touch', 'off', 'empty');
     const m = pub.find(c => c.main.includes(id)), t = pub.find(c => c.touch.includes(id));
@@ -174,15 +253,18 @@ function paintOverview(g, svg) {
   svg.querySelectorAll('.gmap-edge').forEach(l => { l.classList.remove('lit'); l.style.removeProperty('--cc'); });
 }
 
-function renderIndex(root) {
-  const svg = mk('svg', { id: 'gmap-index', role: 'img', 'aria-label': 'GPU 탐색 지도' }, root.querySelector('.gmap-wrap'));
-  const g = draw(svg);
+function renderIndex(root, mapId) {
+  const M = MAPS[mapId];
+  const node = id => nodeIn(M, id);
+  const svg = mk('svg', { id: 'gmap-index-' + mapId, role: 'img', 'aria-label': M.aria }, root.querySelector('.gmap-wrap'));
+  const g = draw(svg, M);
   const list = root.querySelector('.gmap-chapters');
   const panel = root.querySelector('.gmap-panel');
   const idle = '칸을 누르면 그 칸을 다루는 장이 보여요. 장에 손을 올리면 그 장이 지나간 길만 켜져요.';
   panel.textContent = idle;
 
-  CHAPTERS.forEach(c => {
+  const mine = CHAPTERS.filter(c => c.map === mapId);
+  mine.forEach(c => {
     const li = document.createElement('li');
     li.className = 'gmap-ch ' + c.status;
     li.style.setProperty('--cc', c.color);
@@ -194,7 +276,7 @@ function renderIndex(root) {
     d.className = 'desc';
     d.textContent = (c.status === 'planned' ? '예정 · ' : '') + '주로 ' + c.main.map(id => node(id).t).join(', ');
     li.appendChild(d);
-    const on = () => paint(g, svg, c, 'index'), off = () => paintOverview(g, svg);
+    const on = () => paint(g, svg, c, 'index'), off = () => paintOverview(g, svg, mapId);
     li.addEventListener('mouseenter', on); li.addEventListener('mouseleave', off);
     li.addEventListener('focusin', on); li.addEventListener('focusout', off);
     list.appendChild(li);
@@ -202,7 +284,7 @@ function renderIndex(root) {
 
   const pick = id => {
     const n = node(id);
-    const hits = CHAPTERS.map(c => ({ c, k: c.main.includes(id) ? '주로' : c.touch.includes(id) ? '스쳐 감' : null })).filter(h => h.k);
+    const hits = mine.map(c => ({ c, k: c.main.includes(id) ? '주로' : c.touch.includes(id) ? '스쳐 감' : null })).filter(h => h.k);
     panel.textContent = '';
     const b = document.createElement('b'); b.textContent = n.t; panel.appendChild(b);
     panel.appendChild(document.createTextNode(' — ' + n.s + '. '));
@@ -223,13 +305,13 @@ function renderIndex(root) {
     a.addEventListener('click', () => pick(a.dataset.id));
     a.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(a.dataset.id); } });
   });
-  paintOverview(g, svg);
+  paintOverview(g, svg, mapId);
 }
 
 function renderChapter(root, chId) {
   const ch = CHAPTERS.find(c => c.id === chId);
   const svg = mk('svg', { id: 'gmap-' + chId, role: 'img', 'aria-label': ch.no + '장이 다루는 곳' }, root.querySelector('.gmap-wrap'));
-  const g = draw(svg);
+  const g = draw(svg, MAPS[ch.map]);
   paint(g, svg, ch, 'chapter');
   Object.values(g).forEach(a => {
     const to = ch.at[a.dataset.id];
@@ -242,7 +324,9 @@ function renderChapter(root, chId) {
 
 document.querySelectorAll('[data-gmap]').forEach(root => {
   const v = root.dataset.gmap;
-  if (v === 'index') renderIndex(root); else renderChapter(root, v);
+  if (v === 'index' || v === 'index:p1') renderIndex(root, 'p1');
+  else if (v.startsWith('index:')) renderIndex(root, v.slice(6));
+  else renderChapter(root, v);
 });
-window.GPUMap = { NODES, EDGES, CHAPTERS };
+window.GPUMap = { MAPS, CHAPTERS };
 })();

@@ -410,22 +410,7 @@ const el = (tag, cls, text) => {
     });
     return { traceEvents: E, displayTimeUnit: 'ms' };
   }
-  const PF = 'https://ui.perfetto.dev';
-  function openPerfetto(trace) {
-    const w = window.open(PF); // 클릭 핸들러 안에서 바로 열어야 팝업 차단에 안 걸린다
-    if (!w) return false;
-    const buffer = new TextEncoder().encode(JSON.stringify(trace)).buffer;
-    let n = 0, iv = null;
-    const done = () => { clearInterval(iv); window.removeEventListener('message', onMsg); };
-    const onMsg = e => {
-      if (e.origin !== PF || e.data !== 'PONG') return;
-      done();
-      w.postMessage({ perfetto: { buffer, title: 'GPU Sim 6장 · 시뮬레이터가 만든 trace', fileName: 'gpu-sim-ch06.json' } }, PF);
-    };
-    window.addEventListener('message', onMsg);
-    iv = setInterval(() => { if (w.closed || ++n > 120) { done(); return; } w.postMessage('PING', PF); }, 250);
-    return true;
-  }
+  const openPerfetto = tr => window.GPUSimPerfetto.open(tr, 'GPU Sim 6장 · 시뮬레이터가 만든 trace', 'gpu-sim-ch06.json');
 
   root.addEventListener('click', e => {
     const a = e.target.closest('button')?.dataset.act;

@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7장 · BO와 자리</title>
+<meta name="description" content="clCreateBuffer 한 줄이 ANGLE의 memory type, radv의 domain, amdgpu의 GEM BO를 거쳐 VRAM이나 GTT에 자리를 받기까지. 그리고 VRAM이 찼을 때 TTM이 하는 일.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+
+<p class="crumb"><a href="../">GPU Sim</a> · 2부 · 7장</p>
+<h1>BO와 자리 — 버퍼는 어디에 놓이나요</h1>
+<p class="lead">1부는 명령이 흐르는 길이었어요. 2부는 그 명령이 읽고 쓰는 버퍼 하나의 일생을 따라가요. 첫 장은 태어나는 순간이에요. <code>clCreateBuffer</code> 한 줄이 커널 드라이버의 BO(buffer object) 하나가 되고, VRAM이나 GTT 가운데 한 자리를 받기까지요. 그런데 따라가 보면, ANGLE 위의 OpenCL 버퍼는 외장 GPU에서도 VRAM에 놓이지 않아요.</p>
+
+<div class="note">이 장은 <b>ANGLE의 OpenCL 구현</b>(Vulkan 백엔드)과 ANGLE이 쓰는 <b>VMA</b>(Vulkan Memory Allocator), <b>Mesa radv</b>, <b>리눅스 amdgpu·TTM</b>을 따라가요. 코드는 2026-11의 각 main(리눅스는 master, 7.4-rc4) 브랜치를 읽었어요. 기준은 VRAM이 따로 있는 <b>외장 GPU</b>이고, 보안 메모리(TMZ)와 device-coherent 메모리는 뺐어요. 결론은 코드를 읽어서 낸 것이고, 실제 기기에서 재 본 것은 아니에요. 시뮬레이터 2의 크기와 밀어내기 순서는 지어낸 모델이에요. 무엇이 사실이고 무엇이 가정인지는 글 끝에 나눠 적었어요.</div>
+
+<figure class="chapter-map" data-gmap="ch07">
+  <div class="gmap-wrap"></div>
+  <figcaption>2부 지도에서 이 장이 지나가는 길. 진한 칸이 주로 다루는 곳이고, 칸을 누르면 그 절로 가요. <a href="../">전체 지도</a></figcaption>
+</figure>
+
+<h2 id="s1">1. 한 줄이 네 번 이름을 바꿔요</h2>
+
+<p>앱 쪽에서는 <code>cl_mem</code> 하나지만, 아래로 내려가며 층마다 다른 이름을 얻고, 층마다 「어디에 둘지」를 조금씩 정해요.</p>
+
+<table class="tbl">
+<thead><tr><th>층</th><th>이름</th><th>여기서 정하는 것</th></tr></thead>
+<tbody>
+<tr><td>앱</td><td><code>cl_mem</code></td><td><code>CL_MEM_*</code> 플래그 — 호스트 포인터를 쓸지, 호스트 메모리에 둘지</td></tr>
+<tr><td>ANGLE</td><td><code>VkBuffer</code> + <code>VkDeviceMemory</code></td><td>메모리 속성(<code>HOST_VISIBLE</code> 등)으로 Vulkan <b>memory type</b> 하나를 고름</td></tr>
+<tr><td>radv</td><td>winsys BO</td><td>그 memory type에 묶인 <b>domain</b>(VRAM·GTT)과 플래그, 그리고 GPU 가상 주소</td></tr>
+<tr><td>amdgpu · TTM</td><td>GEM 핸들 → <code>amdgpu_bo</code></td><td>원하는 곳(preferred)과 허용하는 곳(allowed), 그리고 <b>실제 자리</b></td></tr>
+</tbody>
+</table>
+
+<p>ANGLE은 OpenCL 버퍼마다 <code>VkDeviceMemory</code>를 따로 하나 할당해요. 큰 덩어리를 받아 잘라 쓰지 않아요(<code>BufferHelper::init</code>이 버퍼 전체를 한 할당으로 잡아요). radv는 <code>vkAllocateMemory</code> 한 번에 BO 하나를 만들어요. 그래서 이 길에서는 <code>clCreateBuffer</code> 한 번이 커널의 BO 하나예요.</p>
+
+<p>두 낱말만 먼저 정리할게요. <b>VRAM</b>은 그래픽 카드에 붙은 메모리예요. 그중 CPU가 PCIe BAR 창으로 들여다볼 수 있는 앞부분을 이 장에서는 「보이는 VRAM」이라고 불러요. <b>GTT</b>는 시스템 RAM인데, GPU의 주소 변환표(GART)에 올려 GPU도 읽고 쓸 수 있게 만든 쪽이에요. GPU 캐시에서 처리되지 않아 GTT의 실제 메모리를 읽어야 할 때는 PCIe를 건너가요.</p>
+
+<h2 id="s2">2. ANGLE은 「CPU가 볼 수 있게」만 청해요</h2>
+
+<p>ANGLE은 OpenCL 플래그를 Vulkan 메모리 속성으로 바꿀 때 이렇게 해요(<code>GetMemoryPropertyFlags</code>).</p>
+
+<table class="tbl">
+<thead><tr><th><code>CL_MEM_*</code></th><th>ANGLE이 청하는 속성</th></tr></thead>
+<tbody>
+<tr><td>(없음) · <code>COPY_HOST_PTR</code></td><td><code>HOST_VISIBLE</code></td></tr>
+<tr><td><code>ALLOC_HOST_PTR</code> · <code>USE_HOST_PTR</code></td><td><code>HOST_VISIBLE | HOST_COHERENT | HOST_CACHED</code></td></tr>
+</tbody>
+</table>
+
+<p><code>DEVICE_LOCAL</code>(GPU 가까운 메모리)은 어느 경우에도 청하지 않아요. 왜 <code>HOST_VISIBLE</code>은 늘 들어갈까요? ANGLE은 <code>clEnqueueReadBuffer</code>·<code>WriteBuffer</code>를 막는 호출로 부르면, 큐를 끝낸 뒤 버퍼를 CPU에 매핑해 <code>memcpy</code>로 바로 복사해요(<code>copyTo</code>·<code>copyFrom</code>). 버퍼를 만들자마자 매핑도 해 둬요. 이 설계에서는 모든 버퍼를 CPU가 볼 수 있어야 해요.</p>
+
+<p>그다음 <code>BufferHelper::init</code>이 그 속성을 둘로 나눠요. <code>HOST_VISIBLE</code>은 「꼭」(required), 나머지는 「되도록」(preferred)이에요. 이걸 VMA에 넘기면 VMA는 memory type을 0번부터 차례로 보며 값을 매겨요. 「꼭」을 못 갖춘 타입은 건너뛰고, 「되도록」 중 없는 비트 하나마다 1점을 매겨요. 0점이 나오면 그 자리에서 멈춰요(<code>FindMemoryTypeIndex</code>). ANGLE이 쓰는 VMA 사용법(<code>VMA_MEMORY_USAGE_UNKNOWN</code>)에서는 VMA가 따로 <code>DEVICE_LOCAL</code>을 얹지도 않아요.</p>
+
+<p>그럼 radv가 내놓는 memory type 목록이 결과를 정해요. 외장 GPU에서 radv는 이 순서로 타입을 늘어놓아요(<code>radv_physical_device_init_mem_types</code>).</p>
+
+<table class="tbl">
+<thead><tr><th>번호</th><th>속성</th><th>radv가 붙이는 domain · 플래그</th></tr></thead>
+<tbody>
+<tr><td>0</td><td><code>DEVICE_LOCAL</code></td><td>VRAM · <code>NO_CPU_ACCESS</code></td></tr>
+<tr><td>1</td><td><code>DEVICE_LOCAL</code></td><td>VRAM · <code>NO_CPU_ACCESS | 32BIT</code></td></tr>
+<tr><td>2</td><td><code>HOST_VISIBLE | HOST_COHERENT</code></td><td>GTT · <code>GTT_WC | CPU_ACCESS</code></td></tr>
+<tr><td>3</td><td><code>DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT</code></td><td>VRAM · <code>CPU_ACCESS</code> (보이는 VRAM)</td></tr>
+<tr><td>4</td><td>3과 같음</td><td>VRAM · <code>CPU_ACCESS | 32BIT</code></td></tr>
+<tr><td>5</td><td><code>HOST_VISIBLE | HOST_COHERENT | HOST_CACHED</code></td><td>GTT · <code>CPU_ACCESS</code></td></tr>
+<tr><td>6</td><td>5와 같음</td><td>GTT · <code>CPU_ACCESS | 32BIT</code></td></tr>
+</tbody>
+</table>
+
+<p><code>32BIT</code> 타입(1·4·6)은 descriptor 버퍼처럼 32비트 주소가 필요한 버퍼만 쓰고, 보통 버퍼의 <code>memoryTypeBits</code>에서는 빠져요(<code>radv_get_buffer_memory_requirements</code>). 남은 0·2·3·5번에 VMA 규칙을 대 보면 이래요.</p>
+
+<ul>
+<li><b>평범한 <code>clCreateBuffer</code></b> — 「꼭」 <code>HOST_VISIBLE</code>, 「되도록」 없음. 0번은 「꼭」이 없어 건너뛰고, 2번이 0점이라 바로 멈춰요. <b>GTT, write-combined</b> 타입이에요(radv가 USWC를 요청해요. 실제 WC 매핑은 CPU 아키텍처와 커널의 WC 지원을 전제로 해요).</li>
+<li><b><code>CL_MEM_ALLOC_HOST_PTR</code></b> — 「되도록」 <code>HOST_COHERENT | HOST_CACHED</code>. 2번과 3번은 <code>CACHED</code>가 없어 1점, 5번이 0점이에요. <b>GTT, CPU 캐시 됨</b>이에요.</li>
+</ul>
+
+<p>3번(보이는 VRAM)은 2번 뒤에 있어서, 「되도록」에 <code>DEVICE_LOCAL</code>이 없는 한 뽑히지 않아요. 할당할 때 ANGLE이 한 번 더 고르지만(<code>AllocateBufferMemory</code> → <code>FindCompatibleMemory</code>), 이번엔 「VMA가 고른 타입의 속성을 다 가진 첫 타입」이라 결과가 같아요. 정리하면, 2026-11의 ANGLE·radv에서 OpenCL 버퍼는 외장 GPU에서도 <b>GTT</b>에 놓여요. 버퍼의 실제 내용(backing)이 시스템 RAM에 있어서, 커널의 읽기가 GPU 캐시에서 끝나지 않고 메모리까지 가야 할 때는 PCIe를 건너가요. 반대로 Vulkan 앱이 <code>DEVICE_LOCAL</code>을 골라 0번으로 할당하면 VRAM에 놓여요. 시뮬레이터 1에서 둘을 나란히 볼 수 있어요.</p>
+
+<p><code>USE_HOST_PTR</code>은 길이 하나 더 있어요. 드라이버가 호스트 메모리 가져오기(<code>VK_EXT_external_memory_host</code>)를 지원하고 포인터와 크기가 정렬돼 있으면, ANGLE은 새로 할당하지 않고 앱의 메모리를 그대로 가져다 써요(zero-copy). 이 길은 11장 「호스트와 나누기」에서 따라가요.</p>
+
+<h2 id="s3">3. radv — 타입을 domain과 플래그로</h2>
+
+<p>radv는 memory type마다 domain과 플래그를 미리 짝지어 둬요(위 표 오른쪽 칸). <code>vkAllocateMemory</code>가 오면 그 짝을 꺼내고, 다른 프로세스와 나누지 않는 메모리면 <code>NO_INTERPROCESS_SHARING | PREFER_LOCAL_BO</code>를 더해요(<code>radv_alloc_memory</code>). 그다음 winsys가 커널에 보낼 요청을 만들어요(<code>radv_amdgpu_winsys_bo_create</code>).</p>
+
+<ul>
+<li>domain이 VRAM이면 요청 도메인에 VRAM을 넣고 <code>CPU_GTT_USWC</code>를 켜요. 그리고 <b>GTT도 같이 넣어요</b>. 소스 주석은 이유를 이렇게 적어요. 둘 다 넣어도 amdgpu는 처음엔 VRAM을 고르지만, 버퍼가 GTT로 넘칠 수 있게 돼요. VRAM만 주면 amdgpu가 VRAM에 넣으려고 너무 애써서 쓸데없는 이동이 많아진다고요. 이 동작은 <code>RADV_PERFTEST=nogttspill</code>로 끌 수 있어요.</li>
+<li>domain이 GTT면 요청 도메인은 GTT 하나예요.</li>
+<li>플래그는 이렇게 옮겨요. <code>CPU_ACCESS</code>는 <code>CPU_ACCESS_REQUIRED</code>, <code>NO_CPU_ACCESS</code>는 그대로, <code>GTT_WC</code>는 <code>CPU_GTT_USWC</code>(CPU 쪽 매핑을 캐시 없이 write-combine으로)가 돼요. 화면 출력 버퍼처럼 암묵적 동기화가 필요한 게 아니면 <code>EXPLICIT_SYNC</code>도 켜요. 나누지 않는 로컬 BO면 <code>VM_ALWAYS_VALID</code>도 켜는데, 9장 residency에서 다시 만나요.</li>
+</ul>
+
+<p>하나 더 있어요. radv는 커널에 BO를 청하기 <b>전에</b> 이 BO가 쓸 GPU 가상 주소 범위부터 잡아 둬요(<code>ac_drm_va_range_alloc</code>). 주소와 자리는 따로 정해지는 거예요. 이 이야기는 8장 「GPU VM」의 몫이에요.</p>
+
+<h2 id="s4">4. 커널 — 원하는 곳과 허용하는 곳</h2>
+
+<p><code>DRM_IOCTL_AMDGPU_GEM_CREATE</code>를 받은 amdgpu는 먼저 플래그와 도메인을 검사하고, 사용자 BO에는 언제나 <code>VRAM_CLEARED</code>를 켜요. 「VRAM에 놓이면 0으로 지워 달라」는 뜻이에요. 다른 프로세스가 쓰던 내용이 새 버퍼에 비치면 안 되니까요. 그리고 BO를 만들며 도메인을 두 갈래로 기억해요(<code>amdgpu_bo_create</code>).</p>
+
+<ul>
+<li><b>preferred</b> — 요청한 도메인 그대로예요.</li>
+<li><b>allowed</b> — 보통은 preferred와 같아요. 다만 요청이 <b>VRAM 하나뿐</b>이면 GTT를 몰래 더해요. 나중에 밀려날 곳을 남겨 두는 거예요.</li>
+</ul>
+
+<p>이제 실제 자리 후보 목록을 만들어요(<code>amdgpu_bo_placement_from_domain</code>). VRAM이 있으면 VRAM이 먼저, GTT가 있으면 그다음이에요. VRAM 후보에는 두 가지가 붙어요. <code>CPU_ACCESS_REQUIRED</code>가 있으면 후보 범위를 <b>보이는 VRAM까지</b>로 줄여요. 없으면 <code>TOPDOWN</code>을 붙여 VRAM의 끝에서부터 채워요. 그러면 CPU가 들여다보는 앞부분이 그만큼 덜 차요.</p>
+
+<p>그다음 TTM이 이 후보를 순서대로 해 봐요. 자리가 정해졌는데 그게 VRAM이면, amdgpu는 이미 지워진 것으로 관리되는 구간은 건너뛰고, 필요한 구간에 복사 엔진의 「0으로 지우기」 작업을 맡겨요. 새 fence가 생기면 BO의 예약 객체(<code>dma_resv</code>)에 걸어요. 그러면 새 BO를 처음 쓰는 GPU 일은 이 지우기가 끝나기를 기다려요. 6장의 fence가 버퍼 쪽에서 다시 나오는 셈이에요. 마지막으로 사용자 BO의 <code>CPU_ACCESS_REQUIRED</code>를 지워요. 소스 주석대로, 처음 자리를 잡을 때만 따르는 힌트로 다루는 거예요.</p>
+
+<p>아래에서 플래그를 골라 한 칸씩 넘겨 보세요. 표의 강조는 그 단계에서 보는 memory type이에요.</p>
+
+<div class="sim ch7" id="sim-path">
+  <div class="sim-title">시뮬레이터 1 · clCreateBuffer 한 번의 길 (외장 GPU · radv)</div>
+  <div class="controls pathopts">
+    <label class="inline"><input type="radio" name="pflag" value="none" checked> 플래그 없음</label>
+    <label class="inline"><input type="radio" name="pflag" value="copy"> <code>COPY_HOST_PTR</code></label>
+    <label class="inline"><input type="radio" name="pflag" value="alloc"> <code>ALLOC_HOST_PTR</code></label>
+    <label class="inline"><input type="radio" name="pflag" value="vk"> 비교: Vulkan 앱이 <code>DEVICE_LOCAL</code> 타입으로</label>
+  </div>
+  <div class="mtwrap"></div>
+  <div class="relay-state"></div>
+  <ol class="relay"></ol>
+  <div class="cbtns">
+    <button data-act="next" class="primary">다음 →</button>
+    <button data-act="auto">자동</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="say"></div>
+</div>
+
+<h2 id="s5">5. VRAM이 찼을 때</h2>
+
+<p>후보를 해 보는 TTM의 규칙은 두 바퀴예요(<code>ttm_bo_mem_space</code> → <code>ttm_bo_alloc_resource</code>).</p>
+
+<ol>
+<li><b>첫 바퀴 — 밀어내지 않고.</b> 후보를 순서대로 보며 빈 자리가 있는 첫 곳에 놓아요. VRAM이 차 있으면 다음 후보(GTT)로 그냥 넘어가요. 처음 만드는 BO는 아직 자리가 없어서 GTT 후보에 「밀어낼 때만 쓰는 후보」(<code>FALLBACK</code>) 표시가 붙지 않아요. 이미 자리가 있는 BO를 다시 놓을 때는 붙을 수 있어서, 이 규칙을 그대로 옮기면 안 돼요(9장).</li>
+<li><b>둘째 바퀴 — 밀어내서라도.</b> 첫 바퀴에서 아무 데도 못 놓았을 때만 돌아요. 이번엔 후보 자리에 있던 다른 BO를 밀어내고(evict) 자리를 만들어요. 일반적으로 밀려나는 VRAM BO는 GTT를 먼저, SYSTEM(시스템 메모리)을 다음 후보로 삼아요(<code>amdgpu_evict_flags</code>). 조건에 따라 보이는 VRAM에서 안 보이는 VRAM으로 먼저 옮기기도 하고, SYSTEM으로 가는 이동은 실제로 임시 GTT 자리를 거칠 수 있어요. GTT에 있던 BO가 밀려나면 SYSTEM으로 가요.</li>
+</ol>
+
+<p>그래서 radv의 기본 요청(VRAM|GTT)은 VRAM이 차 있으면 <b>아무도 밀어내지 않고 GTT에서 태어나요</b>. VRAM만 청하면(<code>nogttspill</code>) 첫 바퀴에 실패하고, 둘째 바퀴에서 다른 BO를 밀어내 VRAM에 들어가요.</p>
+
+<p>두 바퀴보다 먼저 걸리는 문도 하나 있어요. <code>amdgpu_bo_create</code>는 TTM에 넘기기 전에 크기부터 봐요(<code>amdgpu_bo_validate_size</code>). 요청에 GTT가 있으면 GTT 전체 크기보다, 없으면 VRAM 전체 크기보다 작아야 해요. 여기서 거절되거나 자리 잡기에 실패하면 ioctl이 한 번 더 시도해요. <code>CPU_ACCESS_REQUIRED</code>가 있으면 먼저 빼 보고, 그다음 VRAM 하나뿐인 요청에 GTT를 더해서요(<code>amdgpu_gem_create_ioctl</code>의 <code>retry</code>, 시그널로 끊긴 <code>-ERESTARTSYS</code>는 빼고요).</p>
+
+<p>radv 주석이 말한 「VRAM만 주면 너무 애쓴다」는 앞의 둘째 바퀴예요. 대신 GTT에서 태어난 BO는 원하는 곳(VRAM)에 있지 않은 셈이라, 나중에 제출할 때 VRAM으로 다시 옮겨질 수 있어요. 이건 9장 residency에서 봐요.</p>
+
+<div class="sim ch7" id="sim-full">
+  <div class="sim-title">시뮬레이터 2 · VRAM이 찼을 때 (VRAM 8칸 · GTT 8칸)</div>
+  <div class="controls">
+    <label class="inline">크기 <select data-k="size"><option value="1">1칸</option><option value="2" selected>2칸</option><option value="3">3칸</option><option value="9">9칸 (VRAM보다 큼)</option></select></label>
+  </div>
+  <div class="cbtns">
+    <button data-act="vg" class="primary">VRAM|GTT로 만들기 (radv 기본)</button>
+    <button data-act="v">VRAM만 (nogttspill)</button>
+    <button data-act="g">GTT만 (ANGLE 버퍼)</button>
+    <button data-act="reset">처음부터</button>
+    <button data-act="perfetto">Perfetto에서 열기 ↗</button>
+  </div>
+  <div class="mem"></div>
+  <ol class="ttmlog"></ol>
+  <div class="say"></div>
+</div>
+
+<p>세 가지를 해 보세요.</p>
+<ol>
+<li><b>VRAM|GTT로 2칸을 다섯 번.</b> 넷째까지 VRAM에 놓이고, 다섯째는 VRAM이 찼으니 첫 바퀴에서 바로 GTT로 가요. 밀려나는 BO는 없어요.</li>
+<li><b>처음부터, VRAM|GTT로 2칸 넷 → VRAM만으로 2칸 하나.</b> 첫 바퀴는 실패하고, 둘째 바퀴에서 가장 오래된 B1이 GTT로 밀려나요. 새 BO는 VRAM에 들어가요.</li>
+<li><b>처음부터, VRAM만으로 9칸.</b> 두 바퀴까지 가지도 못하고 크기 검사에서 거절돼요. ioctl이 GTT를 더해 다시 시도하지만, 이번엔 GTT 전체(8칸)와 견주니 역시 거절돼요.</li>
+</ol>
+
+<div class="note">시뮬레이터 2의 규칙이에요. 크기는 칸 수로만 세고 조각남(fragmentation)은 없어요. 밀어낼 BO는 만든 순서대로 가장 오래된 것부터 골라요. 실제 TTM은 LRU(최근에 덜 쓴 것) 순서와 우선순위를 따르는데, 이 모델엔 「쓰기」가 없어서 만든 순서로 대신했어요. 보이는 VRAM, 고정(pin)된 BO, 다른 프로세스의 BO는 없어요. VRAM에 놓일 때마다 지우기 작업이 생긴다고 두었어요(실제로는 이미 지워진 구간은 건너뛰어요). 밀려나는 BO는 최종 목적지(GTT, 없으면 SYSTEM)만 그렸고, 보이는 VRAM 안에서의 이동과 임시 GTT를 거치는 이동은 뺐어요. 「VRAM만」 요청의 allowed에 GTT가 더해지는 것, 크기 검사, 두 바퀴 규칙, ioctl의 다시 시도는 커널 코드를 따랐어요.</div>
+
+<h2 id="s6">6. Perfetto로 보면</h2>
+
+<p>시뮬레이터 2의 「Perfetto에서 열기 ↗」를 누르면 그때까지의 판이 <a href="https://ui.perfetto.dev">Perfetto</a> 새 탭에 떠요. 6장처럼 trace는 이 브라우저 안에서만 오가요. 아직 믿지 않은 공개 출처에서 열면 Perfetto가 「이 출처를 믿나요?」를 물어요(이미 믿은 출처나 localhost에서는 묻지 않아요). 한 번 누를 때마다 1ms가 흐른다고 놓았어요. 이번 trace엔 <b>카운터 트랙</b>이 있어요. VRAM·GTT·SYSTEM에 놓인 칸 수가 계단 그래프로 그려져요. 시뮬레이터 2의 두 번째 놀이를 하고 열면, 밀어내는 순간 VRAM 계단이 잠깐 내려가고 GTT가 올라가요. 이어서 새 BO가 들어오면 VRAM은 원래 높이로 돌아와요.</p>
+
+<table class="tbl">
+<thead><tr><th>묶음 · 줄</th><th>보이는 것</th></tr></thead>
+<tbody>
+<tr><td>앱 · GEM_CREATE</td><td>ioctl 하나가 한 조각. 조각을 누르면 요청 도메인·크기·결과가 보여요</td></tr>
+<tr><td>amdgpu · tracepoint</td><td>실제 tracepoint 이름을 딴 순간 표시 <code>amdgpu_bo_move</code>·<code>amdgpu_bo_create</code>. 값은 시뮬레이터가 만든 거예요</td></tr>
+<tr><td>복사 엔진</td><td>VRAM에 놓인 BO를 0으로 지우는 작업</td></tr>
+<tr><td>VRAM · GTT · SYSTEM (카운터)</td><td>메모리마다 찬 칸 수</td></tr>
+</tbody>
+</table>
+
+<h3>진짜 기계에서는 무엇이 찍히나요</h3>
+
+<p>리눅스 master(7.4-rc4, 2026-11) 기준으로 확인한 amdgpu tracepoint 둘이 이 장과 맞닿아요.</p>
+
+<table class="tbl">
+<thead><tr><th>ftrace 이벤트</th><th>찍히는 때</th><th>읽는 법</th></tr></thead>
+<tbody>
+<tr><td><code>amdgpu/amdgpu_bo_create</code></td><td>BO가 자리를 받고, 필요하면 지우기 작업까지 맡긴 뒤(<code>amdgpu_bo_create</code> 끝)</td><td><code>type</code>은 놓인 곳(TTM 번호: 0 SYSTEM, 1 TT=GTT, 2 VRAM), <code>preferred</code>·<code>allowed</code>는 도메인 비트(1 CPU, 2 GTT, 4 VRAM)예요. <code>visible</code>이라는 칸엔 이름과 달리 BO 플래그 전체가 찍혀요</td></tr>
+<tr><td><code>amdgpu/amdgpu_bo_move</code></td><td>BO가 다른 곳으로 옮겨지기 직전(<code>amdgpu_bo_move_notify</code>)</td><td><code>from</code>·<code>to</code>는 TTM 번호예요. 처음 자리를 받을 때도 <code>from=-1</code>로 한 번 찍혀서, 새 BO는 <code>amdgpu_bo_move</code> 다음에 <code>amdgpu_bo_create</code>가 나와요. 예를 들어 VRAM에서 GTT로 밀려날 때는 <code>from=2, to=1</code>로 찍히고, 다른 밀어내기 경로에서는 값도 달라져요</td></tr>
+</tbody>
+</table>
+
+<p>preferred·allowed와 from·to는 텍스트로 찍힐 때의 이름이에요. Perfetto에서 원시 필드를 찾을 때는 각각 <code>prefer</code>·<code>allow</code>, <code>old_placement</code>·<code>new_placement</code>예요. <code>visible</code> 필드는 u32로 받은 BO 플래그 값이에요. <code>amdgpu_bo_move</code>는 옮기기 <b>직전</b>에 찍히니, 이동이 끝났다는 증거는 아니에요.</p>
+
+<p>Perfetto 기록 설정은 6장과 같은 모양에 이벤트만 바꿔요. 길이와 버퍼 크기는 예시예요.</p>
+
+<pre class="code">duration_ms: 10000
+buffers { size_kb: 65536 }
+data_sources {
+  config {
+    name: "linux.ftrace"
+    ftrace_config {
+      ftrace_events: "amdgpu/amdgpu_bo_create"
+      ftrace_events: "amdgpu/amdgpu_bo_move"
+    }
+  }
+}</pre>
+
+<h2>핵심 정리</h2>
+<div class="summary">
+<ul>
+<li><code>clCreateBuffer</code> 한 번은 ANGLE의 <code>VkDeviceMemory</code> 하나, radv BO 하나, 커널 BO 하나예요. 층마다 「어디에 둘지」를 조금씩 정해요.</li>
+<li>ANGLE은 블로킹 읽기·쓰기를 매핑과 <code>memcpy</code>로 하기 때문에 버퍼마다 <code>HOST_VISIBLE</code>만 꼭 청하고, <code>DEVICE_LOCAL</code>은 청하지 않아요. VMA는 「되도록」 점수가 0인 첫 타입을 골라요.</li>
+<li>radv의 타입 순서 때문에 평범한 OpenCL 버퍼는 GTT write-combined(2번), <code>ALLOC_HOST_PTR</code>은 GTT cached(5번)에 놓여요. 외장 GPU에서도 VRAM이 아니에요. <code>DEVICE_LOCAL</code> 타입을 고른 Vulkan 버퍼는 VRAM|GTT로 청해져 VRAM에 놓여요.</li>
+<li>커널은 preferred와 allowed를 따로 기억하고(VRAM 하나뿐이면 allowed에 GTT를 더함), TTM은 밀어내지 않는 첫 바퀴와 밀어내는 둘째 바퀴로 자리를 잡아요. VRAM에 놓인 새 BO는 아직 안 지워진 구간을 복사 엔진이 0으로 지우고, 그 fence가 생기면 첫 사용은 그걸 기다려요.</li>
+<li>진짜 기계에선 <code>amdgpu_bo_create</code>·<code>amdgpu_bo_move</code> tracepoint로 이 과정을 볼 수 있어요.</li>
+</ul>
+</div>
+
+<h2>확인 퀴즈</h2>
+<div id="quiz"></div>
+
+<h2>더 읽기</h2>
+<p>이 장이 읽은 소스예요. 모두 공개 저장소예요.</p>
+<ul>
+<li><a href="https://chromium.googlesource.com/angle/angle/+/refs/heads/main/src/libANGLE/renderer/vulkan/vk_cl_utils.cpp">ANGLE <code>vk_cl_utils.cpp</code></a> — <code>GetMemoryPropertyFlags</code>, CL 플래그가 메모리 속성이 되는 곳</li>
+<li><a href="https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/vulkan/radv_physical_device.c">Mesa <code>radv_physical_device.c</code></a> — <code>radv_physical_device_init_mem_types</code>, memory type 순서와 domain 짝</li>
+<li><a href="https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c">Mesa <code>radv_amdgpu_bo.c</code></a> — GTT를 같이 넣는 이유가 적힌 주석</li>
+<li><a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c">리눅스 <code>amdgpu_object.c</code></a> — preferred·allowed, 자리 후보, VRAM 지우기</li>
+<li><a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/gpu/drm/ttm/ttm_bo.c">리눅스 <code>ttm_bo.c</code></a> — 두 바퀴 자리 잡기</li>
+</ul>
+
+<h2>여기까지가 사실, 여기부터가 단순화</h2>
+<p><b>공개 자료로 확인한 것.</b> ANGLE이 CL 플래그를 메모리 속성으로 바꾸는 규칙은 <code>vk_cl_utils.cpp</code>의 <code>GetMemoryPropertyFlags</code>를 따랐어요. 버퍼를 만들고(<code>CLBufferVk::create</code>), 블로킹 읽기·쓰기를 매핑과 <code>memcpy</code>로 하고(<code>copyTo</code>·<code>copyFrom</code>, <code>CLCommandQueueVk::enqueueReadBuffer</code>·<code>WriteBuffer</code>), <code>USE_HOST_PTR</code>을 zero-copy로 가져오는 조건(<code>supportsZeroCopy</code>)은 <code>CLMemoryVk.cpp</code>·<code>CLCommandQueueVk.cpp</code>를 따랐어요. 「꼭」·「되도록」 나누기, 버퍼마다 따로 할당하고 만들자마자 매핑하는 것은 <code>vk_helpers.cpp</code>의 <code>BufferHelper::init</code>을, VMA를 부르는 방식은 <code>vk_mem_alloc_wrapper.cpp</code>를, 할당 때 다시 고르는 규칙은 <code>vk_utils.cpp</code>의 <code>FindCompatibleMemory</code>를 따랐어요. VMA의 점수 매기기는 VulkanMemoryAllocator <code>vk_mem_alloc.h</code>의 <code>FindMemoryTypeIndex</code>·<code>FindMemoryPreferences</code>를 따랐어요(master와 ANGLE이 고정해 쓰는 revision <code>7e55b011e161</code> 둘 다 같아요). radv의 heap·memory type 순서와 domain·플래그 짝은 <code>radv_physical_device.c</code>를, 보통 버퍼에서 32비트 타입이 빠지는 것은 <code>radv_buffer.c</code>를, device-coherent 타입이 기본으로 빠지는 것은 <code>radv_device.c</code>를, 할당 때 더하는 플래그와 화면 출력 버퍼의 <code>IMPLICIT_SYNC</code>는 <code>radv_device_memory.c</code>를, 커널 요청 만들기와 GTT를 같이 넣는 주석, VA를 먼저 잡는 것은 <code>winsys/amdgpu/radv_amdgpu_bo.c</code>를, <code>nogttspill</code>은 <code>radv_instance.c</code>·<code>radv_device.c</code>를 따랐어요. 커널에서 <code>VRAM_CLEARED</code>를 늘 켜는 것과 다시 시도하는 규칙은 <code>amdgpu_gem.c</code>를, 크기 검사와 USWC 지원 검사(<code>amdgpu_bo_validate_size</code>·<code>amdgpu_bo_support_uswc</code>)도 <code>amdgpu_object.c</code>를, 이미 지워진 구간을 건너뛰는 것은 <code>amdgpu_ttm.c</code>를, preferred·allowed, 자리 후보(<code>TOPDOWN</code>·보이는 VRAM 제한), VRAM 지우기 fence, <code>CPU_ACCESS_REQUIRED</code>를 힌트로 지우는 것, <code>amdgpu_bo_move</code>가 불리는 자리는 <code>amdgpu_object.c</code>를, 처음 자리를 받을 때도 move 알림이 불리는 것과 밀려나는 곳은 <code>amdgpu_ttm.c</code>를, 두 바퀴 규칙은 <code>ttm/ttm_bo.c</code>를, 배치 플래그의 뜻과 TTM 번호는 <code>include/drm/ttm/ttm_placement.h</code>를, 도메인 비트는 <code>include/uapi/drm/amdgpu_drm.h</code>를, tracepoint 칸은 <code>amdgpu_trace.h</code>를 따랐어요(모두 2026-11).</p>
+<p><b>모델의 가정.</b> 결론(OpenCL 버퍼가 GTT에 놓임)은 VRAM이 따로 있는 외장 GPU에서, ANGLE이 radv 위에서 돌고, 보안 메모리와 device-coherent 타입이 꺼져 있다고 두고 코드를 따라가 낸 거예요. 실제 기기에서 재 보지는 않았어요. 일반적인 외장 GPU라면 리사이저블 BAR나 heap 크기 설정이 달라도, GTT write-combined 타입이 보이는 VRAM 타입보다 먼저 나와요. 다만 APU의 통합 heap 설정(<code>enable_unified_heap_on_apu</code>)처럼 GTT heap 자체가 없어지는 경우에는 타입 구성과 번호가 달라져 이 장의 결론을 그대로 적용할 수 없어요. 「버퍼 하나에 BO 하나」는 그 버퍼의 내용을 담는 BO 얘기이고, 페이지 표 같은 내부 BO는 따로 있어요. 시뮬레이터 1은 자리가 남아 있는 경우만 그렸어요. 시뮬레이터 2의 칸 수, 크기, 1ms 박자, 만든 순서로 밀어내기는 지어낸 단순화예요. 실제로는 조각남, LRU·우선순위, 보이는 VRAM, 고정된 BO, 다른 프로세스, 메모리 cgroup 한도가 자리를 바꿔요. GPU 가상 주소(8장), 제출 때 다시 자리 잡기(9장), 해제(10장), 호스트 포인터 가져오기(11장)는 이 장에서 다루지 않았어요.</p>
+
+<footer>
+<p>1판 · 2026-11-24 · Claude가 쓰고 OCL(GPT)이 사실 검토한 글이에요(확인 revision: ANGLE <code>07179e0b56ec</code>, Mesa <code>afcfe21a2b90</code>, Linux <code>8d7fe9885c62</code>). 틀린 곳을 찾으면 리포 이슈로 알려 주세요.</p>
+</footer>
+
+</main>
+<script src="../assets/map.js"></script>
+<script src="../assets/perfetto.js"></script>
+<script src="../assets/ch07.js"></script>
+</body>
+</html>

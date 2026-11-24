@@ -10,8 +10,10 @@
 <body>
 <main class="wide">
 <h1>GPU Sim</h1>
-<p class="lead">GPU를 드라이버 쪽에서 봐요. 앱이 부른 한 줄이 Queue와 PM4 패킷을 거쳐 CU의 wave가 되기까지를 손으로 넘겨 보는 장들이에요. 이해한 만큼만 만들고, 한 장씩 늘려 가요.</p>
+<p class="lead">GPU를 드라이버 쪽에서 봐요. 앱이 부른 한 줄이 Queue와 PM4 패킷을 거쳐 CU의 wave가 되기까지(1부), 그리고 그 일이 읽고 쓰는 버퍼가 어디에 놓이고 어떻게 사라지는지(2부)를 손으로 넘겨 보는 장들이에요. 이해한 만큼만 만들고, 한 장씩 늘려 가요.</p>
 
+<h2 class="part">1부 · 명령이 흐르는 길</h2>
+<p class="part-lead">앱이 부른 한 줄이 PM4 패킷과 링을 거쳐 wave가 되고, 「끝났다」는 소식이 다시 앱까지 돌아오는 길이에요. 지도의 빈 땅을 다 채워서 1부는 끝났어요.</p>
 <section class="gmap-box" data-gmap="index">
   <div>
     <div class="gmap-wrap"></div>
@@ -28,6 +30,23 @@
   </div>
 </section>
 
+<h2 class="part">2부 · 버퍼의 일생</h2>
+<p class="part-lead">1부의 명령이 읽고 쓰는 버퍼 하나를 따라가요. 태어나 자리를 받고, GPU 주소를 얻고, 밀려났다 돌아오고, fence를 기다려 사라지기까지예요. 장마다 「Perfetto로 보면」 칸이 있어서 시뮬레이터 결과를 바로 Perfetto에서 열 수 있어요.</p>
+<section class="gmap-box" data-gmap="index:p2">
+  <div>
+    <div class="gmap-wrap"></div>
+    <div class="gmap-legend">
+      <span><i class="m"></i>장이 주로 다룬 칸</span>
+      <span><i class="t"></i>스쳐 간 칸</span>
+      <span><i class="e"></i>아직 빈 땅</span>
+    </div>
+    <p class="gmap-note">위 띠는 사용자 공간(앱·ANGLE·Mesa radv), 가운데 띠는 커널 드라이버(amdgpu·TTM), 아래 띠는 버퍼가 실제로 놓이는 곳이에요. 실선은 버퍼를 만드는 길, 점선 「mmap」은 CPU가 BO를 매핑하는 길, 점선 「밀려남」은 GTT의 페이지가 시스템 쪽으로 밀려나는 길이에요. fence·해제와 TTM 사이 점선은 「일이 끝나야 자리를 비울 수 있다」는 뜻이에요. 1부와 2부를 한 장에 모은 통합 지도는 2부가 쌓인 뒤 따로 만들 거예요.</p>
+  </div>
+  <div>
+    <ul class="gmap-chapters"></ul>
+    <div class="gmap-panel" aria-live="polite"></div>
+  </div>
+</section>
 <footer>
 <p>Claude가 만들고 OCL(GPT)이 사실을 검토해요. 공부 기록 블로그: <a href="https://jayinlab.github.io/">jayinlab.github.io</a></p>
 </footer>

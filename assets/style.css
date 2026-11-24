@@ -19,6 +19,11 @@
   --c4: #c0561b;
   --c5: #b8336a;
   --c6: #5d7f12;
+  --c7: #2b7bb9;
+  --c8: #7a5c2e;
+  --c9: #a23b8c;
+  --c10: #3c8d3a;
+  --c11: #b0602a;
   --wg-l: 52%;
   --on-c: #ffffff;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -45,6 +50,11 @@
     --c4: #ff9e64;
     --c5: #ff85b3;
     --c6: #b6dc5a;
+    --c7: #6cc4ff;
+    --c8: #d9b77a;
+    --c9: #f29be0;
+    --c10: #8fdc7c;
+    --c11: #ffb27a;
     --wg-l: 62%;
     --on-c: #10131a;
   }
@@ -435,3 +445,27 @@ pre.code { margin: 0; font: .8rem/1.6 var(--mono); background: var(--surface); b
   .relay li { grid-template-columns: minmax(0, 1fr); gap: 2px; }
 }
 .relay li.nest .who { padding-left: .4em; }
+
+/* 메인: 부 머리 */
+h2.part { margin-top: 2em; }
+.part-lead { color: var(--ink-2); margin: 0 0 .4em; }
+
+/* 7장 · BO와 자리 */
+.ch7 .relay li.cur { border-left-color: var(--c7); background: color-mix(in srgb, var(--c7) 13%, var(--surface)); }
+.ch7 .relay li .who { color: var(--c7); }
+.ch7 .rs.got { border-color: var(--c7); background: color-mix(in srgb, var(--c7) 12%, var(--surface)); }
+.pathopts { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.mttbl { font-size: .78rem; margin: 8px 0 4px; }
+.mttbl th, .mttbl td { padding: 4px 7px; }
+.mttbl tr.out td { opacity: .35; }
+.mttbl tr.pick td { background: color-mix(in srgb, var(--c7) 16%, var(--surface)); font-weight: 700; }
+.memrow { display: grid; grid-template-columns: 6.4em minmax(0, 1fr); gap: 8px; align-items: center; margin: 6px 0; }
+.memname { font-size: .74rem; font-weight: 700; color: var(--ink-2); font-family: var(--mono); }
+.membar { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 3px; min-height: 30px; padding: 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.memchips { display: flex; flex-wrap: wrap; gap: 4px; min-height: 24px; align-items: center; }
+.bo { display: flex; align-items: center; justify-content: center; min-height: 24px; padding: 0 6px; border-radius: 5px; font-style: normal; font-size: .72rem; font-family: var(--mono); font-weight: 700; color: var(--on-c); background: var(--c7); border: 2px solid transparent; overflow: hidden; white-space: nowrap; }
+.bo.g { background: color-mix(in srgb, var(--c7) 55%, var(--ink-2)); }
+.bo.moved { border-color: var(--bad); }
+.ttmlog { margin: 8px 0; padding-left: 1.3em; font-size: .8rem; line-height: 1.6; color: var(--ink-2); }
+.ttmlog li.ev { color: var(--warn); }
+.ttmlog li.fail { color: var(--bad); }
