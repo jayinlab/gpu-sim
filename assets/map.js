@@ -78,6 +78,13 @@ const CHAPTERS = [
     touch: ['app', 'angle', 'vk', 'regs', 'disp'],
     at: { app: 's1', angle: 's1', vk: 's1', clspv: 's2', compiler: 's3', regs: 's4', disp: 's4' },
   },
+  {
+    id: 'ch06', no: '06', status: 'published', color: 'var(--c6)',
+    title: '완료 대기 — 「끝났다」는 누가 알아채나요', href: 'ch06/',
+    main: ['wait'],
+    touch: ['app', 'angle', 'vk', 'kmd', 'cp', 'fence'],
+    at: { fence: 's1', cp: 's2', kmd: 's2', vk: 's2', wait: 's3', angle: 's3', app: 's4' },
+  },
 ];
 
 const NS = 'http://www.w3.org/2000/svg';

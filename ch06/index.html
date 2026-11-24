@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6장 · 완료 대기</title>
+<meta name="description" content="clFinish와 event는 무엇을 기다릴까요. GPU가 RELEASE_MEM으로 번호를 쓰고, 인터럽트가 dma_fence를 신호하고, 잠든 호스트 스레드가 깨어 event를 COMPLETE로 바꾸기까지.">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+
+<p class="crumb"><a href="../">GPU Sim</a> · 6장</p>
+<h1>완료 대기 — 「끝났다」는 누가 알아채나요</h1>
+<p class="lead">1장에서 fence는 「GPU가 일을 끝내면 정해 둔 자리에 번호 N을 쓴다」였어요. 4장에서는 그 번호를 쓰는 패킷 <code>RELEASE_MEM</code>에 L2 내보내기도 같이 실린다는 걸 봤고요. 그런데 GPU가 메모리에 숫자를 썼다고 <code>clFinish</code>가 바로 돌아오진 않아요. 그 숫자를 누군가 봐야 하고, 기다리던 스레드를 깨워야 하고, 깨어난 스레드가 event를 바꿔야 해요. 이 장은 「끝났다」는 소식이 GPU에서 앱까지 건너오는 길을 따라가요.</p>
+
+<div class="note">이 장은 <b>ANGLE의 OpenCL 구현</b>(Vulkan 백엔드), <b>Mesa radv</b>와 Vulkan 공통 코드, <b>리눅스 amdgpu</b>와 DRM 공통 코드를 따라가요. 패킷과 인터럽트는 GFX9 compute 링을 기준으로 했어요. 코드는 2026-11의 각 main(리눅스는 master) 브랜치를 읽었어요. 시뮬레이터 1은 실제 함수 순서를 그대로 옮겼고, 걸리는 시간은 넣지 않았어요. 시뮬레이터 2는 ANGLE이 event 상태를 바꾸는 규칙을 옮겼지만 시간은 지어낸 박자예요. 무엇이 사실이고 무엇이 가정인지는 글 끝에 나눠 적었어요.</div>
+
+<figure class="chapter-map" data-gmap="ch06">
+  <div class="gmap-wrap"></div>
+  <figcaption>이 장이 지나가는 길. 진한 칸이 주로 다루는 곳이고, 칸을 누르면 그 절로 가요. <a href="../">전체 지도</a></figcaption>
+</figure>
+
+<h2 id="s1">1. 「끝났다」는 세 번 일어나요</h2>
+
+<p>커널 하나가 끝나는 순간은 하나처럼 보이지만, 드라이버 쪽에서 보면 적어도 세 번이에요.</p>
+
+<table class="tbl">
+<thead><tr><th>순간</th><th>누가 아나</th><th>무엇이 남나</th></tr></thead>
+<tbody>
+<tr><td>① wave가 다 끝남</td><td>GPU의 CP</td><td>아무것도 안 남아요. CP는 다음 패킷을 읽어요(1장)</td></tr>
+<tr><td>② 번호를 씀</td><td>메모리의 fence 칸</td><td><code>RELEASE_MEM</code>이 앞선 일이 끝나기를 기다렸다가 캐시를 처리하고 번호 N을 써요(4장). 쓰기가 확인되면 인터럽트도 보내요</td></tr>
+<tr><td>③ 호스트가 알아챔</td><td>커널 드라이버 → 기다리던 스레드 → ANGLE</td><td>인터럽트 처리기가 번호를 읽고 그 번호까지의 <code>dma_fence</code>를 신호해요. 잠든 스레드가 깨어나고, ANGLE이 event를 <code>CL_COMPLETE</code>로 바꿔요</td></tr>
+</tbody>
+</table>
+
+<p>앱이 보는 건 ③뿐이에요. <code>clFinish</code>가 돌아오는 것도, event가 <code>CL_COMPLETE</code>가 되는 것도, 콜백이 불리는 것도 ③이에요. 그리고 ③은 저절로 일어나지 않아요. <b>누군가 기다리고 있어야</b> 일어나요. 2절은 ②에서 ③까지의 길을, 3절은 「누가 기다리나」를 봐요.</p>
+
+<h2 id="s2">2. 번호에서 깨어남까지 — 신호 릴레이</h2>
+
+<p>그 전에 한 가지가 먼저 일어나 있어요. 제출 ioctl이 넘긴 job을 GPU 스케줄러가 링에 쓸 때, amdgpu는 패킷 끝에 그 job의 번호를 쓰는 <code>RELEASE_MEM</code>을 붙이고 하드웨어 fence를 하나 만들어요(<code>amdgpu_fence_emit</code>). 스케줄러는 그 fence에 「끝나면 알려 달라」는 콜백을 걸어 둬요. 그다음 앱 스레드가 <code>clFinish</code>를 불렀다고 해 볼게요. ANGLE은 남은 명령을 제출하고, 마지막으로 제출한 묶음 번호까지 끝났는지 확인해요. 가장 오래된 묶음부터 <code>vkGetFenceStatus</code>로 물어보고, 아직 안 끝났을 때만 그 묶음의 <code>VkFence</code>를 <code>vkWaitForFences</code>로 기다려요(<code>CommandQueue::finishResourceUse</code>). 제한 시간은 <code>UINT64_MAX</code>, 곧 끝없이요(<code>Renderer::getMaxFenceWaitTimeNs</code>). 이미 끝나 있으면 잠들지 않고 지나가요. 안 끝났다면 그 아래는 이렇게 이어져요.</p>
+
+<ol>
+<li><b>Mesa</b> — <code>vk_common_WaitForFences</code>가 fence를 DRM syncobj로 기다려요. ioctl은 <code>DRM_IOCTL_SYNCOBJ_WAIT</code>이고, 플래그는 <code>WAIT_FOR_SUBMIT</code>(아직 제출 전이어도 기다림)와 <code>WAIT_ALL</code>이에요.</li>
+<li><b>커널 DRM</b> — <code>drm_syncobj_array_wait_timeout</code>이 syncobj에 든 <code>dma_fence</code>에 콜백을 걸고, 스레드를 <code>TASK_INTERRUPTIBLE</code>로 재워요(<code>schedule_timeout</code>). 이때부터 앱 스레드는 CPU를 쓰지 않아요.</li>
+<li><b>GPU</b> — 마지막 dispatch의 wave가 다 끝나면 CP가 <code>RELEASE_MEM</code>을 처리해요. amdgpu가 링에 써 둔 이 패킷은 end-of-pipe 이벤트(<code>CACHE_FLUSH_AND_INV_TS_EVENT</code>)라 앞선 일이 다 끝나기를 기다리고, 캐시를 처리한 뒤 fence 주소에 번호를 써요. <code>INT_SEL(2)</code>라서 쓰기가 확인되면 인터럽트를 보내요(<code>gfx_v9_0_ring_emit_fence</code>).</li>
+<li><b>인터럽트 처리기</b> — <code>gfx_v9_0_eop_irq</code>가 인터럽트에 실린 me·pipe·queue로 어느 compute 링인지 찾아 <code>amdgpu_fence_process</code>를 불러요.</li>
+<li><b>amdgpu_fence_process</b> — 메모리의 fence 칸을 읽어요. 지난번에 본 번호(<code>last_seq</code>) 다음부터 지금 번호까지, 그 사이의 하드웨어 fence를 모두 <code>dma_fence_signal</code>해요.</li>
+<li><b>GPU 스케줄러</b> — 하드웨어 fence에 걸려 있던 <code>drm_sched_job_done_cb</code>가 그 job의 스케줄러 fence(<code>finished</code>)를 신호해요. 제출 ioctl(<code>amdgpu_cs</code>)이 syncobj에 넣어 둔 건 이 <code>finished</code> fence예요.</li>
+<li><b>깨우기</b> — syncobj 대기가 걸어 둔 콜백 <code>syncobj_wait_fence_func</code>가 <code>wake_up_process</code>로 앱 스레드를 깨워요. 스레드는 루프를 한 번 더 돌며 fence가 신호됐는지 보고 ioctl에서 돌아와요.</li>
+<li><b>ANGLE</b> — <code>vkWaitForFences</code>가 <code>VK_SUCCESS</code>로 돌아오면, ANGLE은 그 묶음을 끝난 것으로 옮기고 호스트 쪽 뒷일을 해요. 그리고 그 번호까지의 event를 <code>CL_COMPLETE</code>로 바꾸고 콜백을 불러요. 그다음에야 <code>clFinish</code>가 돌아와요.</li>
+</ol>
+
+<p>8단계 중 GPU가 하는 건 3번 하나예요. 나머지는 CPU가 하는데, 그 CPU는 4번의 인터럽트가 올 때까지 이 일을 모르고 있어요. 5~7번은 사실 한 호출 안에서 일어나요. <code>dma_fence_signal</code>은 그 fence에 걸린 콜백을 그 자리에서 부르고, 그 콜백이 또 다음 fence를 신호하거든요. 아래 시뮬레이터는 이 호출 관계를 한 칸씩 펼쳐 놓은 거예요. 두 상자는 실제 코드에서 갈라지는 길이에요.</p>
+
+<div class="sim" id="sim-relay">
+  <div class="sim-title">시뮬레이터 1 · 신호 릴레이 (GFX9 compute 링 하나)</div>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" data-k="pair"> 제출 둘이 거의 같이 끝나요</label>
+    <label class="inline"><input type="checkbox" data-k="lost"> 인터럽트가 안 와요</label>
+  </div>
+  <div class="relay-state"></div>
+  <ol class="relay"></ol>
+  <div class="cbtns">
+    <button data-act="next" class="primary">다음 →</button>
+    <button data-act="auto">자동</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="say"></div>
+</div>
+
+<p>「제출 둘이 거의 같이 끝나요」를 켜면 인터럽트 하나가 fence 둘을 한꺼번에 신호해요. <code>amdgpu_fence_process</code>는 인터럽트 하나에 fence 하나를 짝짓지 않아요. 메모리에 지금 적힌 번호를 읽고 거기까지를 다 처리해요. 두 번째 인터럽트가 왔을 땐 번호가 <code>last_seq</code>와 같아서 그냥 돌아가요. 번호가 「여기까지 끝났다」는 뜻이라서(1장) 가능한 일이에요.</p>
+
+<p>「인터럽트가 안 와요」를 켜면 예비 길이 보여요. GPU 스케줄러는 job을 링에 쓰자마자 하드웨어 fence에 콜백을 걸어요. 이때 amdgpu는 링마다 하나인 예비 타이머를 <code>HZ / 2</code>, 곧 0.5초로 걸어 둬요(<code>amdgpu_fence_enable_signaling</code>, 이미 걸려 있으면 그대로). 인터럽트가 오면 처리기가 이 타이머를 지우고, 아직 안 끝난 fence가 남았으면 다시 걸어요. 인터럽트가 끝내 안 오면 타이머가 울릴 때 대신 <code>amdgpu_fence_process</code>를 부르고, 실제로 진행된 fence가 있었으면 커널 로그에 <code>Fence fallback timer expired on ring …</code>을 남겨요. 시뮬레이터는 타이머가 울리기 전에 GPU 일이 끝났다고 둬요. 그러면 일은 끝났는데, 타이머가 걸린 때부터 0.5초가 될 때까지 아무도 몰라요. 다만 이 타이머는 계속 도는 polling이 아니에요. 울릴 때 아직 안 끝났다면 스스로 다시 걸리지 않으니, 인터럽트를 잃어버린 걸 언제나 구해 주는 장치는 아니에요. 이 로그가 자주 보이면 인터럽트 경로를 의심해 볼 수 있어요.</p>
+
+<h2 id="s3">3. event 상태는 누가 바꾸나요</h2>
+
+<p>OpenCL event에는 상태가 넷 있어요. <code>CL_QUEUED</code>(큐에 들어감) → <code>CL_SUBMITTED</code>(호스트가 디바이스에 제출함) → <code>CL_RUNNING</code>(디바이스가 실행 중) → <code>CL_COMPLETE</code>(끝남). 사양의 정의는 GPU 쪽 사실처럼 들리지만, ANGLE에서 이 상태를 바꾸는 건 모두 호스트 코드예요.</p>
+
+<table class="tbl">
+<thead><tr><th>상태</th><th>ANGLE에서 바뀌는 때</th><th>함수</th></tr></thead>
+<tbody>
+<tr><td><code>CL_QUEUED</code></td><td>enqueue할 때. 지금 기록 중인 명령 묶음의 번호(queue serial)를 받아요</td><td><code>preEnqueueOps</code> · <code>postEnqueueOps</code></td></tr>
+<tr><td><code>CL_SUBMITTED</code></td><td>그 묶음을 Renderer의 커맨드 버퍼로 넘길 때</td><td><code>flushComputePassCommands</code></td></tr>
+<tr><td><code>CL_RUNNING</code></td><td><b><code>vkQueueSubmit</code>을 부른 직후</b>. GPU가 실제로 시작했는지는 보지 않아요</td><td><code>submitCommands</code></td></tr>
+<tr><td><code>CL_COMPLETE</code></td><td><b>호스트 스레드가 그 번호까지 끝난 걸 확인하고</b>(필요하면 fence를 기다려서) 호스트 쪽 뒷일까지 마쳤을 때</td><td><code>finishQueueSerialInternal</code></td></tr>
+</tbody>
+</table>
+
+<p>그래서 두 가지가 따라 나와요. 하나, <code>clGetEventInfo</code>로 상태를 물어도 ANGLE은 GPU에 묻지 않아요. 저장해 둔 값을 돌려줄 뿐이에요(<code>CLEventVk::getCommandExecutionStatus</code>). 둘, <code>CL_COMPLETE</code>로 바꾸는 스레드는 둘 중 하나예요. 앱이 <code>clFinish</code>나 막는 호출(blocking read 등), <code>clWaitForEvents</code>를 불렀으면 <b>앱 스레드</b>가 직접 기다려요. 앱이 <code>clFlush</code>를 불렀으면 큐마다 하나 있는 <b>백그라운드 스레드</b>(이름 <code>ANGLE-CL-CQD</code>)가 그 번호를 받아 대신 기다려요(<code>DispatchWorkThread::finishLoop</code>). 둘 다 없으면 아무도 기다리지 않으니, GPU가 일을 끝냈어도 event는 그대로예요.</p>
+
+<p>프로파일링도 같은 길을 타요. 사양에서 <code>CL_PROFILING_COMMAND_START</code>·<code>END</code>는 디바이스에서 실행을 시작하고 끝낸 시각이에요. 그런데 2026-11 main의 ANGLE은 상태가 바뀌는 순간의 <b>CPU 시각</b>을 적어요. 소스에도 「지금은 CPU 시각, 나중에 Vulkan GPU 타임스탬프 쿼리로」라는 TODO가 있어요(<code>CLEventVk::setTimestamp</code>). 그러니 START는 <code>vkQueueSubmit</code> 직후이고, END는 호스트가 알아챈 때예요. 한 묶음에 든 명령들은 같은 제출·완료 처리 안에서 차례로 시각이 적혀요. event마다 CPU 시계를 따로 읽고, 앞 event의 콜백을 부른 뒤에 다음 event로 넘어가니 값이 같거나 가깝다는 보장은 없어요. 콜백이 오래 걸리거나 스레드가 밀려나면 차이가 커질 수도 있어요. 어느 쪽이든 커널 하나하나가 GPU에서 돈 구간은 아니에요. 이 값은 큐를 <code>CL_QUEUE_PROFILING_ENABLE</code>로 만들었을 때만 적혀요.</p>
+
+<p>아래에서 커널을 넣고, 보내고, 기다려 보세요. 표의 왼쪽은 ANGLE이 들고 있는 값이고, 오른쪽 끝 칸은 모델 속 GPU에서 실제로 일어난 일이에요.</p>
+
+<div class="sim" id="sim-event">
+  <div class="sim-title">시뮬레이터 2 · event 상태판 (ANGLE 규칙 · 커널 하나 4박자)</div>
+  <div class="cbtns">
+    <button data-act="enq" class="primary">커널 넣기 (event와 함께)</button>
+    <button data-act="flush">clFlush</button>
+    <button data-act="finish">clFinish</button>
+    <button data-act="wait1">clWaitForEvents(e1)</button>
+    <button data-act="poll">clGetEventInfo</button>
+    <button data-act="tick">시간 4박자 흐르기</button>
+    <button data-act="reset">처음부터</button>
+  </div>
+  <div class="evthreads"></div>
+  <div class="evwrap"></div>
+  <div class="say"></div>
+</div>
+
+<p>네 가지를 해 보세요.</p>
+<ol>
+<li><b>커널 셋을 넣고 시간만 흘려 보기.</b> 아무도 보내지 않았으니 GPU는 놀고, event는 계속 <code>CL_QUEUED</code>예요. <code>clGetEventInfo</code>를 몇 번 불러도 같아요. 2장에서 본 「flush는 약속, 자동 제출은 친절」이 여기서도 보여요.</li>
+<li><b>셋을 넣고 <code>clFlush</code> → 시간 흐르기.</b> 넣자마자 <code>CL_RUNNING</code>이 돼요. GPU는 아직 첫 커널도 끝내지 않았는데요. 셋이 다 끝난 뒤 <code>ANGLE-CL-CQD</code> 스레드가 깨어나면 셋이 한꺼번에 <code>CL_COMPLETE</code>가 돼요. START와 END도 셋이 같아요(이 모델의 단순화예요. 실제로는 event마다 따로 읽은 CPU 시각이라 다를 수 있어요). GPU에서는 4박자씩 차례로 돌았는데요.</li>
+<li><b>셋을 넣고 <code>clWaitForEvents(e1)</code>.</b> 사양은 e1만 기다리면 된다고 해요. 그런데 ANGLE은 지금 그 event의 큐를 통째로 <code>finish</code>해요(<code>CLContextVk::waitForEvents</code>. 소스에 「queue serial만 기다리도록 고칠 것」이라는 TODO가 있어요). 그래서 e2·e3까지 끝나야 돌아와요.</li>
+<li><b>둘을 넣고 <code>clFlush</code> → 하나 더 넣고 시간 흐르기.</b> 앞의 둘은 백그라운드 스레드가 기다려 줘서 <code>CL_COMPLETE</code>가 되지만, 뒤에 넣은 셋째는 아직 기록 중인 묶음에 있어서 <code>CL_QUEUED</code>에 머물러요. <code>clFlush</code>는 부른 그 순간까지의 명령만 보내요.</li>
+</ol>
+
+<div class="note">시뮬레이터 2의 규칙이에요. 커널은 GPU에서 4박자씩 들어온 순서대로 하나씩 돌고, 제출 비용은 0박자예요. 깨어나는 데 1박자가 걸려요. 박자 수는 지어낸 값이에요. 실제 ANGLE이 커널 사이에 barrier를 넣는지는 버퍼 의존성과 wait list에 따라 달라서(<code>addMemoryDependencies</code>), 차례로 돈다는 건 이 모델의 단순화예요. 한 묶음의 프로파일링 시각을 똑같이 적는 것도 단순화예요. 상태가 바뀌는 때와 프로파일링 시각을 고르는 규칙, <code>clWaitForEvents</code>가 큐를 통째로 기다리는 것, <code>clFlush</code>가 백그라운드 스레드에 번호를 넘기는 것은 ANGLE 코드를 따랐어요.</div>
+
+<h3>clFinish는 GPU 말고도 기다려요</h3>
+
+<p><code>finishQueueSerialInternal</code>은 fence가 돌아온 뒤 event를 바꾸기 <b>전에</b> 호스트 쪽 뒷일을 해요(<code>CommandsStateMap::processQueueSerialUpTo</code>). 호스트 메모리와 주고받는 복사 항목(host transfer)을 마무리하고, 커널이 <code>printf</code>를 썼으면 printf 버퍼를 매핑해 읽어 출력해요(<code>ClspvProcessPrintfBuffer</code>). 그래서 ANGLE에서 커널의 <code>printf</code>는 GPU가 그 줄을 지날 때가 아니라 호스트가 그 묶음을 끝낼 때 한꺼번에 나와요. 4장에서 본 것처럼 fence만으로는 호스트 가시성이 보장되지 않는데, ANGLE은 호스트가 볼 수 있는 버퍼에 쓴 묶음이면 넘기기 전에 <code>MEMORY_WRITE → HOST_READ</code> 배리어를 끝에 넣어요(<code>flushComputePassCommands</code>).</p>
+
+<h2 id="s4">4. 기다리는 방법 셋 — 잠들기, 물어보기, 맡기기</h2>
+
+<table class="tbl">
+<thead><tr><th>방법</th><th>Vulkan · OpenCL</th><th>아래에서 일어나는 일</th></tr></thead>
+<tbody>
+<tr><td>잠들기</td><td><code>vkWaitForFences</code> · <code>clFinish</code> · <code>clWaitForEvents</code></td><td>2절의 길이에요. 스레드는 커널에서 자고, fence 콜백이 깨워요. 기다리는 동안 CPU를 쓰지 않지만, 깨어나는 데 스케줄러 시간이 들어요</td></tr>
+<tr><td>물어보기</td><td><code>vkGetFenceStatus</code></td><td>Mesa는 제한 시간 0으로 같은 대기 경로를 불러요. 아직이면 <code>ETIME</code>이 돌아오고, 그걸 <code>VK_NOT_READY</code>로 바꿔요(<code>vk_common_GetFenceStatus</code>). ANGLE도 묶음을 정리할 때 이걸로 먼저 물어보고, 안 끝났을 때만 잠들어요(<code>checkOneCommandBatchLocked</code>)</td></tr>
+<tr><td>맡기기</td><td><code>clSetEventCallback</code></td><td>ANGLE에선 미리 걸어 둔 콜백을 상태를 바꾸는 스레드가 그 자리에서 불러요(<code>setStatusAndExecuteCallback</code>). <code>clFlush</code> 뒤라면 <code>ANGLE-CL-CQD</code> 스레드, <code>clFinish</code> 안이라면 앱 스레드예요. 걸 때 이미 그 상태를 지났다면 <code>clSetEventCallback</code>을 부른 스레드가 바로 불러요(<code>Event::setCallback</code>). 콜백 안에서 오래 일하면 그 스레드가 다음 묶음을 늦게 봐요</td></tr>
+</tbody>
+</table>
+
+<p><code>clGetEventInfo</code>를 돌며 <code>CL_COMPLETE</code>를 기다리는 「물어보기」는 ANGLE에선 조심해야 해요. 3절에서 본 것처럼 그 값은 누가 기다려 줘야 바뀌어요. 앞서 <code>clFlush</code>를 불러 백그라운드 스레드가 기다리게 해 두면 결국 바뀌지만, 그렇지 않으면 바뀌지 않을 수 있어요.</p>
+
+<p>커널 안에도 바쁘게 도는 대기가 있어요. <code>amdgpu_fence_wait_polling</code>은 인터럽트 없이 fence 칸을 계속 읽어요. 이 함수는 KIQ(링을 관리하는 내부 큐)처럼 인터럽트를 쓰지 않는 커널 내부 경로가 써요. 앱이 기다리는 길이 아니에요.</p>
+
+<h2 id="s5">5. 손으로 만들어 보기</h2>
+
+<p><a href="https://jayinlab.github.io/nand-game/">NAND 게임</a>에서 이 장의 양 끝을 손으로 해 볼 수 있어요. 8부 「펜스」에선 dispatch 뒤에 <code>RELEASE_MEM</code>을 직접 써서 GPU가 기억 칸에 값을 쓰게 해요. 이 장 2절의 3번이에요. 9부 「기다려야 읽어요」는 <code>SUBMIT</code> 뒤 <code>WAIT_FENCE</code> 없이 결과를 읽으면 아직 계산 안 된 값을 읽는다는 걸 보여 줘요. 10부에선 그 대기가 <code>vkWaitForFences</code>가 돼요. 게임은 그 사이의 인터럽트, 깨우기, event 상태를 접어 두었어요. 이 장이 그 접힌 부분이에요.</p>
+
+<h2>핵심 정리</h2>
+<div class="summary">
+<ul>
+<li>「끝났다」는 세 번 일어나요. wave가 끝나고, <code>RELEASE_MEM</code>이 fence 칸에 번호를 쓰고, 호스트가 그 번호를 알아채요. 앱이 보는 건 마지막 하나예요.</li>
+<li>GFX9 compute 링에서 번호를 쓴 <code>RELEASE_MEM</code>은 인터럽트도 보내요. 처리기(<code>amdgpu_fence_process</code>)는 지금 적힌 번호까지의 fence를 한꺼번에 신호하고, 스케줄러 fence와 syncobj 콜백을 거쳐 잠든 스레드를 깨워요. 인터럽트가 안 오면 0.5초 예비 타이머가 한 번 대신 봐 줄 수 있어요.</li>
+<li>ANGLE에서 <code>CL_RUNNING</code>은 「<code>vkQueueSubmit</code>을 불렀다」이고, <code>CL_COMPLETE</code>는 「호스트 스레드가 그 번호까지 끝난 걸 확인하고 뒷일을 마쳤다」예요. <code>clGetEventInfo</code>는 GPU에 묻지 않아요.</li>
+<li>COMPLETE로 바꿔 주는 건 <code>clFinish</code>·<code>clWaitForEvents</code>·막는 호출을 부른 앱 스레드, 또는 <code>clFlush</code>가 깨운 <code>ANGLE-CL-CQD</code> 스레드예요. 아무도 안 기다리면 GPU가 끝내도 그대로예요.</li>
+<li>2026-11의 ANGLE은 프로파일링 시각을 상태가 바뀐 순간의 CPU 시각으로 적어요. 한 묶음의 명령은 같은 처리 안에서 차례로 적히니, 그 값은 커널마다의 GPU 시간이 아니에요. <code>clWaitForEvents</code>는 그 event의 큐를 통째로 기다려요.</li>
+</ul>
+</div>
+
+<h2>확인 퀴즈</h2>
+<div id="quiz"></div>
+
+<h2>더 읽기</h2>
+<p>블로그에서 이 장의 완료 대기를 다른 각도로 다룬 글이에요.</p>
+<ul>
+<li><a href="https://jayinlab.github.io/opencl-note-fence-sequence-event-completion/">OpenCL 드라이버의 fence sequence: event COMPLETE는 어디서 태어나나</a> — 1절의 번호가 event에 붙는 이유. 2절의 「번호까지 한꺼번에 신호」를 개념으로 봐요</li>
+<li><a href="https://jayinlab.github.io/clfinish-internals/">clFinish의 완료 대기 — OpenCL 보장과 Vulkan·AMDGPU 구현 예</a> — 사양의 약속과 ANGLE·amdgpu 구현을 나눠 본 글. 이 장은 그 구현 쪽을 인터럽트까지 내려가요</li>
+<li><a href="https://jayinlab.github.io/opencl-note-clflush-vs-clfinish/">OpenCL에서 clFlush와 clFinish를 언제 나눠 써야 하는가</a> — 루프 안 <code>clFinish</code>의 비용. 시뮬레이터 2에서 <code>clFinish</code>를 커널마다 눌러 보면 GPU가 매번 쉬는 게 보여요</li>
+</ul>
+
+<h2>여기까지가 사실, 여기부터가 단순화</h2>
+<p><b>공개 자료로 확인한 것.</b> event의 네 상태와 프로파일링 값의 정의는 Khronos OpenCL 3.0 API 사양을 따랐어요. ANGLE에서 상태가 바뀌는 때(enqueue → <code>CL_QUEUED</code>, <code>flushComputePassCommands</code> → <code>CL_SUBMITTED</code>, <code>submitCommands</code> → <code>CL_RUNNING</code>, <code>finishQueueSerialInternal</code> → <code>CL_COMPLETE</code>), <code>clFlush</code>가 <code>DispatchWorkThread</code>(<code>ANGLE-CL-CQD</code>)에 번호를 넘겨 대신 기다리게 한다는 것, 커널 사이 barrier가 버퍼 의존성에 따라 들어간다는 것(<code>addMemoryDependencies</code>), finish 때 host transfer와 printf를 처리한다는 것, 호스트가 볼 수 있는 버퍼면 HOST_READ 배리어를 넣는다는 것은 ANGLE <code>src/libANGLE/renderer/vulkan/CLCommandQueueVk.cpp</code>를 따랐어요. 상태를 GPU에 묻지 않고 돌려준다는 것, 상태를 바꾸는 스레드가 콜백을 부른다는 것, 프로파일링 시각이 event마다 읽는 CPU 시각이라는 것과 그 TODO는 <code>CLEventVk.cpp</code>를, 이미 지난 상태의 콜백은 거는 자리에서 부른다는 것은 <code>CLEvent.cpp</code>를, <code>clWaitForEvents</code>가 큐를 <code>finish</code>한다는 것은 <code>CLContextVk.cpp</code>를, 가장 오래된 묶음부터 <code>vkGetFenceStatus</code>로 묻고 안 끝났으면 <code>vkWaitForFences</code>로 기다린다는 것은 <code>CommandQueue.cpp</code>와 <code>vk_wrapper.h</code>를, 제한 시간이 <code>UINT64_MAX</code>라는 것은 <code>vk_renderer.cpp</code>를 따랐어요. Mesa의 fence 대기와 상태 조회는 <code>src/vulkan/runtime/vk_fence.c</code>를, syncobj ioctl과 플래그는 <code>vk_drm_syncobj.c</code>를, radv가 제출 때 syncobj 신호를 싣는다는 것(<code>AMDGPU_CHUNK_ID_SYNCOBJ_OUT</code> 등)은 <code>src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c</code>를 따랐어요. 리눅스에서 syncobj 대기가 콜백을 걸고 잠든다는 것과 깨우는 함수는 <code>drivers/gpu/drm/drm_syncobj.c</code>를, 제출 ioctl이 스케줄러 <code>finished</code> fence를 syncobj에 넣는다는 것은 <code>amdgpu/amdgpu_cs.c</code>를, 하드웨어 fence가 스케줄러 fence를 신호한다는 것은 <code>scheduler/sched_main.c</code>를, <code>RELEASE_MEM</code>의 이벤트·캐시 비트와 <code>INT_SEL(2)</code>, EOP 인터럽트 처리기는 <code>amdgpu/gfx_v9_0.c</code>를, 번호를 읽어 그 번호까지 신호하는 것, 예비 타이머가 걸리고 다시 걸리는 조건과 그 로그 문구, polling 대기는 <code>amdgpu/amdgpu_fence.c</code>를, fence 신호가 걸린 콜백을 그 자리에서 부른다는 것은 <code>drivers/dma-buf/dma-fence.c</code>를, 타이머 길이 <code>HZ / 2</code>는 <code>amdgpu.h</code>를 따랐어요(모두 2026-11).</p>
+<p><b>모델의 가정.</b> 시뮬레이터 1은 compute 링 하나, 앱 스레드 하나, fence 하나(또는 둘)만 두고, 단계마다 걸리는 시간은 그리지 않았어요. 한 호출 안에서 이어지는 콜백(fence 신호 → 스케줄러 fence → 깨우기)을 따로 칸으로 펼쳤어요. 인터럽트가 IH 링을 거쳐 처리기에 닿는 길, 스케줄러가 job을 링에 쓰는 길(1·2장), GPU 리셋과 타임아웃, 64비트 번호와 한 바퀴 넘침은 뺐어요. 「인터럽트가 안 와요」는 인터럽트가 끝내 오지 않고, 타이머가 울리기 전에 GPU 일이 끝난 경우만 그렸어요. 시뮬레이터 2는 프로파일링을 켠 큐 하나, 같은 우선순위, user event 없음, 커널마다 event 하나를 두었어요. 4박자 커널, 0박자 제출, 1박자 깨어남은 지어낸 값이고, GPU에서 커널이 차례로 돈다는 것과 한 묶음의 시각이 똑같다는 것도 단순화예요. 실제 ANGLE은 <code>clSerializedExecution</code> 같은 기능 플래그나 다른 명령(맵·복사)에서도 제출과 대기를 하고, 백그라운드 스레드가 가득 차면 기다리는 등 더 많은 갈래가 있어요. 여러 VkQueue, timeline semaphore, RDNA와 GFX12의 패킷 차이, ROCm 경로는 다루지 않았어요.</p>
+
+<footer>
+<p>1판 · 2026-11-24 · Claude가 쓰고 OCL(GPT)이 사실 검토한 글이에요. 틀린 곳을 찾으면 리포 이슈로 알려 주세요.</p>
+</footer>
+
+</main>
+<script src="../assets/map.js"></script>
+<script src="../assets/ch06.js"></script>
+</body>
+</html>
