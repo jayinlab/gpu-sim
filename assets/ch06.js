@@ -180,7 +180,9 @@ const el = (tag, cls, text) => {
   let S;
 
   function init() {
-    S = { t: 0, serial: 1, pending: [], batches: [], ev: [], gpuFree: 0, cqd: [], cqdDone: 0, polls: 0, lastSubmitted: 0, blocked: null, msg: '', cls: '' };
+    S = { t: 0, serial: 1, pending: [], batches: [], ev: [], gpuFree: 0, cqd: [], cqdDone: 0, polls: 0, lastSubmitted: 0, blocked: null, msg: '', cls: '',
+      // Perfetto trace용 기록: 앱 호출(순간), 앱 스레드 대기 구간, ANGLE-CL-CQD 대기 구간
+      calls: [], appSpans: [], cqdPushT: {}, cqdSpans: [] };
   }
 
   // flushInternal: 기록하던 묶음을 넘기고(SUBMITTED) vkQueueSubmit(RUNNING). 비어 있으면 빈 제출
@@ -216,6 +218,7 @@ const el = (tag, cls, text) => {
       const at = doneAt(ser, S.cqdDone);
       if (at > until) break;
       S.cqd.shift();
+      S.cqdSpans.push({ ser, a: Math.max(S.cqdPushT[ser], S.cqdDone), end: batchOf(ser).end, b: at });
       S.cqdDone = at;
       setUpTo(ser, 0, at);
     }
@@ -231,9 +234,12 @@ const el = (tag, cls, text) => {
       const k = S.ev.length;
       S.ev.push({ k, serial: S.serial, st: 3, ts: { 3: S.t }, gs: null, ge: null });
       S.pending.push(k);
+      S.calls.push({ t: S.t, n: 'clEnqueueNDRangeKernel (k' + (k + 1) + ')' });
       S.msg = pre + eul('k' + (k + 1)) + ' 넣었어요. event e' + (k + 1) + '은 CL_QUEUED이고, 지금 기록 중인 묶음 #' + S.serial + '에 들어갔어요.';
     } else if (a === 'flush') {
       const b = flushInternal();
+      S.calls.push({ t: S.t, n: 'clFlush → vkQueueSubmit #' + b.serial });
+      S.cqdPushT[b.serial] = S.t;
       S.cqd.push(b.serial);
       runCqd(S.t);
       S.msg = b.ks.length
@@ -249,6 +255,7 @@ const el = (tag, cls, text) => {
       advance(at);
       setUpTo(S.lastSubmitted, 0, at);
       const waited = at - t0;
+      S.appSpans.push({ n: a === 'finish' ? 'clFinish' : 'clWaitForEvents (e1)', ser: S.lastSubmitted, a: t0, end: batchOf(S.lastSubmitted).end, b: at });
       S.blocked = waited;
       if (a === 'finish') {
         S.msg = 'clFinish — 남은 명령을 묶음 ' + ro('#' + b.serial) + ' 보내고, 앱 스레드가 그 fence를 기다렸어요. ' + waited + '박자 동안 막혔다가 ' + at + '박자에 돌아왔어요. 마지막 커널이 끝나고 깨어나는 데 ' + WAKE + '박자가 더 들었어요.';
@@ -260,6 +267,7 @@ const el = (tag, cls, text) => {
       }
     } else if (a === 'poll') {
       S.polls++;
+      S.calls.push({ t: S.t, n: 'clGetEventInfo' });
       const done = S.ev.filter(e => e.ge != null && e.ge <= S.t && e.st !== 0).length;
       const orphan = orphans();
       S.msg = 'clGetEventInfo ×' + S.polls + ' — ANGLE은 GPU에 묻지 않고 저장된 상태를 돌려줘요.' +
@@ -358,9 +366,79 @@ const el = (tag, cls, text) => {
     say.classList.toggle('bad', S.cls === 'bad');
   }
 
+  /* ----- Perfetto 시험판: 지금까지의 판을 Chrome trace(JSON)로 만들어 ui.perfetto.dev로 넘긴다 ----- */
+  // 1박자 = 1ms로 놓는다(지어낸 시간). trace는 이 페이지가 만들어 새 탭에 postMessage로만 건넨다.
+  function buildTrace() {
+    if (!S.ev.length && !S.calls.length) return null;
+    const US = 1000, now = S.t, E = [];
+    const M = (pid, tid, name, sort) => {
+      if (tid == null) {
+        E.push({ ph: 'M', pid, name: 'process_name', args: { name } });
+        E.push({ ph: 'M', pid, name: 'process_sort_index', args: { sort_index: sort } });
+      } else {
+        E.push({ ph: 'M', pid, tid, name: 'thread_name', args: { name } });
+        E.push({ ph: 'M', pid, tid, name: 'thread_sort_index', args: { sort_index: sort } });
+      }
+    };
+    const X = (pid, tid, name, a, b, args) => E.push({ ph: 'X', pid, tid, name, ts: a * US, dur: Math.max(0, b - a) * US, args: args || {} });
+    M(1, null, '호스트 (시뮬레이터가 만든 trace)', 1); M(1, 1, '앱 스레드', 1); M(1, 2, 'ANGLE-CL-CQD', 2);
+    M(2, null, 'GPU (모델)', 2); M(2, 1, 'compute 링', 1);
+    M(3, null, 'event 프로파일링 값 (ANGLE이 적는 CPU 시각)', 3);
+    S.calls.forEach(c => E.push({ ph: 'i', s: 't', pid: 1, tid: 1, name: c.n, ts: c.t * US }));
+    S.appSpans.forEach(sp => {
+      X(1, 1, sp.n, sp.a, sp.b, { '기다린 묶음': '#' + sp.ser, '막힌 박자': sp.b - sp.a });
+      X(1, 1, 'vkWaitForFences (잠듦)', sp.a, Math.max(sp.a, sp.end), { '묶음': '#' + sp.ser });
+      X(1, 1, '깨어나 event COMPLETE', Math.max(sp.a, sp.end), sp.b, {});
+    });
+    S.cqdSpans.forEach(sp => {
+      X(1, 2, '묶음 #' + sp.ser + ' 기다림', sp.a, sp.b, {});
+      X(1, 2, 'vkWaitForFences (잠듦)', sp.a, Math.max(sp.a, sp.end), {});
+      X(1, 2, '깨어나 event COMPLETE', Math.max(sp.a, sp.end), sp.b, {});
+    });
+    S.cqd.forEach((ser, i) => {
+      const a = i === 0 ? Math.max(S.cqdPushT[ser], S.cqdDone) : now;
+      if (a < now) X(1, 2, '묶음 #' + ser + ' 기다리는 중', a, now, { '상태': '이 판의 지금 시각까지' });
+    });
+    S.ev.forEach(e => {
+      if (e.gs != null && e.gs < now) X(2, 1, 'k' + (e.k + 1), e.gs, Math.min(e.ge, now), { '묶음': '#' + e.serial, '상태': e.ge <= now ? '끝남' : '도는 중' });
+      M(3, 10 + e.k, 'e' + (e.k + 1), 10 + e.k);
+      if (e.ts[1] != null) {
+        const closed = e.ts[0] != null;
+        X(3, 10 + e.k, closed ? 'e' + (e.k + 1) + ' START–END' : 'e' + (e.k + 1) + ' START– (END 아직)', e.ts[1], closed ? e.ts[0] : now,
+          { QUEUED: e.ts[3], SUBMIT: e.ts[2], START: e.ts[1], END: closed ? e.ts[0] : '아직', '상태': NAME[e.st] });
+      }
+    });
+    return { traceEvents: E, displayTimeUnit: 'ms' };
+  }
+  const PF = 'https://ui.perfetto.dev';
+  function openPerfetto(trace) {
+    const w = window.open(PF); // 클릭 핸들러 안에서 바로 열어야 팝업 차단에 안 걸린다
+    if (!w) return false;
+    const buffer = new TextEncoder().encode(JSON.stringify(trace)).buffer;
+    let n = 0, iv = null;
+    const done = () => { clearInterval(iv); window.removeEventListener('message', onMsg); };
+    const onMsg = e => {
+      if (e.origin !== PF || e.data !== 'PONG') return;
+      done();
+      w.postMessage({ perfetto: { buffer, title: 'GPU Sim 6장 · 시뮬레이터가 만든 trace', fileName: 'gpu-sim-ch06.json' } }, PF);
+    };
+    window.addEventListener('message', onMsg);
+    iv = setInterval(() => { if (w.closed || ++n > 120) { done(); return; } w.postMessage('PING', PF); }, 250);
+    return true;
+  }
+
   root.addEventListener('click', e => {
     const a = e.target.closest('button')?.dataset.act;
     if (!a) return;
+    if (a === 'perfetto') {
+      const tr = buildTrace();
+      S.cls = '';
+      if (!tr) S.msg = '아직 보낼 게 없어요. 커널을 넣고 몇 가지 눌러 본 뒤에 열어 보세요.';
+      else if (!openPerfetto(tr)) { S.msg = '브라우저가 새 탭을 막았어요. 이 사이트의 팝업을 허용하고 다시 눌러 주세요.'; S.cls = 'bad'; }
+      else S.msg = 'ui.perfetto.dev 새 탭으로 지금까지의 판(' + S.t + '박자, 1박자 = 1ms로 놓음)을 보냈어요. trace는 이 브라우저 안에서만 오가요. Perfetto가 「이 출처를 믿나요」를 물으면 Yes를 눌러 주세요.';
+      render();
+      return;
+    }
     if (a === 'reset') { init(); S.msg = ''; }
     else act(a);
     render();

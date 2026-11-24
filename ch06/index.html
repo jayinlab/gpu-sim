@@ -103,6 +103,7 @@
     <button data-act="poll">clGetEventInfo</button>
     <button data-act="tick">시간 4박자 흐르기</button>
     <button data-act="reset">처음부터</button>
+    <button data-act="perfetto">Perfetto에서 열기 ↗</button>
   </div>
   <div class="evthreads"></div>
   <div class="evwrap"></div>
@@ -142,6 +143,65 @@
 
 <p><a href="https://jayinlab.github.io/nand-game/">NAND 게임</a>에서 이 장의 양 끝을 손으로 해 볼 수 있어요. 8부 「펜스」에선 dispatch 뒤에 <code>RELEASE_MEM</code>을 직접 써서 GPU가 기억 칸에 값을 쓰게 해요. 이 장 2절의 3번이에요. 9부 「기다려야 읽어요」는 <code>SUBMIT</code> 뒤 <code>WAIT_FENCE</code> 없이 결과를 읽으면 아직 계산 안 된 값을 읽는다는 걸 보여 줘요. 10부에선 그 대기가 <code>vkWaitForFences</code>가 돼요. 게임은 그 사이의 인터럽트, 깨우기, event 상태를 접어 두었어요. 이 장이 그 접힌 부분이에요.</p>
 
+<h2 id="s6">6. Perfetto로 보면</h2>
+
+<p>3절 시뮬레이터 2의 「Perfetto에서 열기 ↗」를 누르면, 그때까지 누른 판이 <a href="https://ui.perfetto.dev">Perfetto</a> 새 탭에 시간 축 그림으로 떠요. Perfetto는 리눅스·안드로이드·크롬의 trace를 보는 공개 도구예요. trace(Chrome trace JSON)는 이 페이지가 브라우저 안에서 만들어 새 탭에 바로 건네요. 어떤 서버에도 올라가지 않아요. 처음 열면 Perfetto가 「jayinlab.github.io가 trace를 열려고 해요. 이 출처를 믿나요?」를 물어요. Yes는 이번에만 열고, Always trust는 이 브라우저에 신뢰 설정을 저장해 다음부터 묻지 않아요(localhost 미리보기에서는 묻지 않아요).</p>
+
+<p>trace엔 묶음이 셋 있어요. 묶음 이름을 누르면 펼쳐져요. 시간은 1박자를 1ms로 놓았고, 모두 시뮬레이터가 만든 값이에요.</p>
+
+<table class="tbl">
+<thead><tr><th>묶음 · 줄</th><th>보이는 것</th></tr></thead>
+<tbody>
+<tr><td>호스트 · 앱 스레드</td><td>누른 API(작은 화살표), <code>clFinish</code>·<code>clWaitForEvents</code>로 막힌 구간과 그 안의 잠듦·깨어남</td></tr>
+<tr><td>호스트 · ANGLE-CL-CQD</td><td><code>clFlush</code>가 넘긴 번호를 기다린 구간</td></tr>
+<tr><td>GPU (모델) · compute 링</td><td>커널이 모델 속 GPU에서 실제로 돈 구간</td></tr>
+<tr><td>event 프로파일링 값 · e1, e2…</td><td>ANGLE이 적는 START–END. 조각을 누르면 아래 칸에 QUEUED·SUBMIT까지 보여요</td></tr>
+</tbody>
+</table>
+
+<p>3절의 두 번째 놀이(셋 넣고 <code>clFlush</code> → 시간 흐르기)를 하고 열어 보세요. compute 링 줄에선 k1·k2·k3가 4ms씩 차례로 놓이는데, e1·e2·e3 줄은 같은 자리에 같은 길이로 겹쳐요. 「프로파일링 값은 커널마다의 GPU 시간이 아니에요」를 그림으로 보면 이래요. GPU가 실제로 한 일과 호스트가 적은 값을 한 시간 축에 나란히 놓는 것, 그게 Perfetto로 보는 이유예요.</p>
+
+<h3>진짜 기계에서는 무엇이 찍히나요</h3>
+
+<p>리눅스에서 2절의 릴레이를 Perfetto로 보려면 커널 tracepoint(ftrace 이벤트)를 켜고 기록해요. 아래 이름과 불리는 자리는 리눅스 master(7.4-rc, 2026-11)에서 확인했어요.</p>
+
+<table class="tbl">
+<thead><tr><th>2절 단계</th><th>ftrace 이벤트</th><th>찍히는 때</th></tr></thead>
+<tbody>
+<tr><td>job을 받아 링에 씀</td><td><code>gpu_scheduler/drm_sched_job_queue</code> · <code>drm_sched_job_run</code></td><td>job을 entity에 넣을 때(<code>drm_sched_entity_push_job</code>) · <code>run_job</code> 콜백을 부르기 바로 앞. GPU가 실행을 시작한 때는 아니에요</td></tr>
+<tr><td>2 앱 스레드가 잠듦</td><td><code>sched/sched_switch</code></td><td>앱 스레드가 CPU를 내놓을 때(이전 상태 <code>S</code>)</td></tr>
+<tr><td>4 인터럽트</td><td><code>amdgpu/amdgpu_iv</code></td><td>IH 링에서 인터럽트 항목 하나를 해석할 때마다(<code>amdgpu_irq_dispatch</code>). 완료 인터럽트만 찍히는 건 아니에요</td></tr>
+<tr><td>5 fence 신호</td><td><code>dma_fence/dma_fence_signaled</code></td><td>fence 하나가 신호될 때(<code>dma_fence_signal_timestamp_locked</code>). 하드웨어 fence와 스케줄러 <code>finished</code> fence가 따로 한 번씩 찍혀요. 제출 단계의 <code>scheduled</code> fence 신호도 따로 나와요</td></tr>
+<tr><td>6 스케줄러 fence</td><td><code>gpu_scheduler/drm_sched_job_done</code></td><td><code>finished</code> fence를 신호하기 바로 앞(<code>drm_sched_job_done</code>)</td></tr>
+<tr><td>7 깨우기</td><td><code>sched/sched_waking</code> · <code>sched_wakeup</code></td><td><code>wake_up_process</code>가 앱 스레드를 깨울 때</td></tr>
+</tbody>
+</table>
+
+<p>두 가지에 걸려 넘어지기 쉬워요. 하나, 스케줄러 이벤트 이름은 리눅스 6.17에서 바뀌었어요. 6.16까지는 <code>drm_sched_job</code> · <code>drm_run_job</code> · <code>drm_sched_process_job</code>이에요. 둘, <code>dma_fence/dma_fence_wait_start</code>·<code>wait_end</code>는 이름만 보면 딱 맞아 보이지만 <code>dma_fence_wait_timeout</code> 안에서만 찍혀요. <code>vkWaitForFences</code>가 타는 syncobj 대기(2절 2번)는 이 함수를 거치지 않고 직접 콜백을 걸고 자서 이 이벤트가 나오지 않아요. 이 대기 때문에 잠든 구간은 앱 스레드가 <code>S</code> 상태로 빠지는 <code>sched_switch</code>부터 깨우기가 시작되는 <code>sched_waking</code>까지로 살펴봐요. <code>sched_wakeup</code>은 실행할 수 있게 된 때이고, CPU에서 실제로 다시 도는 건 그 스레드가 <code>next_pid</code>로 들어오는 <code>sched_switch</code>예요. 다만 이 이벤트들만으로 syncobj 대기였다고 단정하거나 API 전체 시간을 재지는 못해요.</p>
+
+<p>Perfetto 기록 설정은 이렇게 써요. 길이와 버퍼 크기는 예시예요. 이 설정에서 켠 이벤트는 커널 안의 일만 보여 줘요. ANGLE·Mesa 함수의 호출 구간을 보려면 따로 사용자 공간 계측이 필요해요. 프로세스·스레드 이름을 채우려면 <code>linux.process_stats</code> 데이터 소스를 더해도 돼요(선택).</p>
+
+<pre class="code">duration_ms: 10000
+buffers { size_kb: 65536 }
+data_sources {
+  config {
+    name: "linux.ftrace"
+    ftrace_config {
+      ftrace_events: "gpu_scheduler/drm_sched_job_queue"
+      ftrace_events: "gpu_scheduler/drm_sched_job_run"
+      ftrace_events: "gpu_scheduler/drm_sched_job_done"
+      ftrace_events: "dma_fence/dma_fence_signaled"
+      ftrace_events: "amdgpu/amdgpu_iv"
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "sched/sched_waking"
+    }
+  }
+}</pre>
+
+<p>파일로 저장해 <code>perfetto --txt -c config.pbtxt -o trace.pftrace</code>로 기록하고, 나온 파일을 ui.perfetto.dev에서 열어요. 이 tracepoint가 있는 커널이어야 하고, <code>traced_probes</code>가 tracefs에 접근할 수 있어야 해요.</p>
+
+<div class="note">이 절은 시험판이에요. 이 장은 진짜 기계의 trace를 싣지 않고, 버튼으로 여는 건 시뮬레이터가 만든 trace뿐이에요.</div>
+
 <h2>핵심 정리</h2>
 <div class="summary">
 <ul>
@@ -150,6 +210,7 @@
 <li>ANGLE에서 <code>CL_RUNNING</code>은 「<code>vkQueueSubmit</code>을 불렀다」이고, <code>CL_COMPLETE</code>는 「호스트 스레드가 그 번호까지 끝난 걸 확인하고 뒷일을 마쳤다」예요. <code>clGetEventInfo</code>는 GPU에 묻지 않아요.</li>
 <li>COMPLETE로 바꿔 주는 건 <code>clFinish</code>·<code>clWaitForEvents</code>·막는 호출을 부른 앱 스레드, 또는 <code>clFlush</code>가 깨운 <code>ANGLE-CL-CQD</code> 스레드예요. 아무도 안 기다리면 GPU가 끝내도 그대로예요.</li>
 <li>2026-11의 ANGLE은 프로파일링 시각을 상태가 바뀐 순간의 CPU 시각으로 적어요. 한 묶음의 명령은 같은 처리 안에서 차례로 적히니, 그 값은 커널마다의 GPU 시간이 아니에요. <code>clWaitForEvents</code>는 그 event의 큐를 통째로 기다려요.</li>
+<li>진짜 기계에서 이 길을 보려면 <code>gpu_scheduler</code>·<code>dma_fence</code>·<code>amdgpu_iv</code>·<code>sched</code> ftrace 이벤트를 켜요. syncobj 대기는 <code>dma_fence_wait_start</code>로 찍히지 않아요.</li>
 </ul>
 </div>
 
@@ -165,11 +226,11 @@
 </ul>
 
 <h2>여기까지가 사실, 여기부터가 단순화</h2>
-<p><b>공개 자료로 확인한 것.</b> event의 네 상태와 프로파일링 값의 정의는 Khronos OpenCL 3.0 API 사양을 따랐어요. ANGLE에서 상태가 바뀌는 때(enqueue → <code>CL_QUEUED</code>, <code>flushComputePassCommands</code> → <code>CL_SUBMITTED</code>, <code>submitCommands</code> → <code>CL_RUNNING</code>, <code>finishQueueSerialInternal</code> → <code>CL_COMPLETE</code>), <code>clFlush</code>가 <code>DispatchWorkThread</code>(<code>ANGLE-CL-CQD</code>)에 번호를 넘겨 대신 기다리게 한다는 것, 커널 사이 barrier가 버퍼 의존성에 따라 들어간다는 것(<code>addMemoryDependencies</code>), finish 때 host transfer와 printf를 처리한다는 것, 호스트가 볼 수 있는 버퍼면 HOST_READ 배리어를 넣는다는 것은 ANGLE <code>src/libANGLE/renderer/vulkan/CLCommandQueueVk.cpp</code>를 따랐어요. 상태를 GPU에 묻지 않고 돌려준다는 것, 상태를 바꾸는 스레드가 콜백을 부른다는 것, 프로파일링 시각이 event마다 읽는 CPU 시각이라는 것과 그 TODO는 <code>CLEventVk.cpp</code>를, 이미 지난 상태의 콜백은 거는 자리에서 부른다는 것은 <code>CLEvent.cpp</code>를, <code>clWaitForEvents</code>가 큐를 <code>finish</code>한다는 것은 <code>CLContextVk.cpp</code>를, 가장 오래된 묶음부터 <code>vkGetFenceStatus</code>로 묻고 안 끝났으면 <code>vkWaitForFences</code>로 기다린다는 것은 <code>CommandQueue.cpp</code>와 <code>vk_wrapper.h</code>를, 제한 시간이 <code>UINT64_MAX</code>라는 것은 <code>vk_renderer.cpp</code>를 따랐어요. Mesa의 fence 대기와 상태 조회는 <code>src/vulkan/runtime/vk_fence.c</code>를, syncobj ioctl과 플래그는 <code>vk_drm_syncobj.c</code>를, radv가 제출 때 syncobj 신호를 싣는다는 것(<code>AMDGPU_CHUNK_ID_SYNCOBJ_OUT</code> 등)은 <code>src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c</code>를 따랐어요. 리눅스에서 syncobj 대기가 콜백을 걸고 잠든다는 것과 깨우는 함수는 <code>drivers/gpu/drm/drm_syncobj.c</code>를, 제출 ioctl이 스케줄러 <code>finished</code> fence를 syncobj에 넣는다는 것은 <code>amdgpu/amdgpu_cs.c</code>를, 하드웨어 fence가 스케줄러 fence를 신호한다는 것은 <code>scheduler/sched_main.c</code>를, <code>RELEASE_MEM</code>의 이벤트·캐시 비트와 <code>INT_SEL(2)</code>, EOP 인터럽트 처리기는 <code>amdgpu/gfx_v9_0.c</code>를, 번호를 읽어 그 번호까지 신호하는 것, 예비 타이머가 걸리고 다시 걸리는 조건과 그 로그 문구, polling 대기는 <code>amdgpu/amdgpu_fence.c</code>를, fence 신호가 걸린 콜백을 그 자리에서 부른다는 것은 <code>drivers/dma-buf/dma-fence.c</code>를, 타이머 길이 <code>HZ / 2</code>는 <code>amdgpu.h</code>를 따랐어요(모두 2026-11).</p>
-<p><b>모델의 가정.</b> 시뮬레이터 1은 compute 링 하나, 앱 스레드 하나, fence 하나(또는 둘)만 두고, 단계마다 걸리는 시간은 그리지 않았어요. 한 호출 안에서 이어지는 콜백(fence 신호 → 스케줄러 fence → 깨우기)을 따로 칸으로 펼쳤어요. 인터럽트가 IH 링을 거쳐 처리기에 닿는 길, 스케줄러가 job을 링에 쓰는 길(1·2장), GPU 리셋과 타임아웃, 64비트 번호와 한 바퀴 넘침은 뺐어요. 「인터럽트가 안 와요」는 인터럽트가 끝내 오지 않고, 타이머가 울리기 전에 GPU 일이 끝난 경우만 그렸어요. 시뮬레이터 2는 프로파일링을 켠 큐 하나, 같은 우선순위, user event 없음, 커널마다 event 하나를 두었어요. 4박자 커널, 0박자 제출, 1박자 깨어남은 지어낸 값이고, GPU에서 커널이 차례로 돈다는 것과 한 묶음의 시각이 똑같다는 것도 단순화예요. 실제 ANGLE은 <code>clSerializedExecution</code> 같은 기능 플래그나 다른 명령(맵·복사)에서도 제출과 대기를 하고, 백그라운드 스레드가 가득 차면 기다리는 등 더 많은 갈래가 있어요. 여러 VkQueue, timeline semaphore, RDNA와 GFX12의 패킷 차이, ROCm 경로는 다루지 않았어요.</p>
+<p><b>공개 자료로 확인한 것.</b> event의 네 상태와 프로파일링 값의 정의는 Khronos OpenCL 3.0 API 사양을 따랐어요. ANGLE에서 상태가 바뀌는 때(enqueue → <code>CL_QUEUED</code>, <code>flushComputePassCommands</code> → <code>CL_SUBMITTED</code>, <code>submitCommands</code> → <code>CL_RUNNING</code>, <code>finishQueueSerialInternal</code> → <code>CL_COMPLETE</code>), <code>clFlush</code>가 <code>DispatchWorkThread</code>(<code>ANGLE-CL-CQD</code>)에 번호를 넘겨 대신 기다리게 한다는 것, 커널 사이 barrier가 버퍼 의존성에 따라 들어간다는 것(<code>addMemoryDependencies</code>), finish 때 host transfer와 printf를 처리한다는 것, 호스트가 볼 수 있는 버퍼면 HOST_READ 배리어를 넣는다는 것은 ANGLE <code>src/libANGLE/renderer/vulkan/CLCommandQueueVk.cpp</code>를 따랐어요. 상태를 GPU에 묻지 않고 돌려준다는 것, 상태를 바꾸는 스레드가 콜백을 부른다는 것, 프로파일링 시각이 event마다 읽는 CPU 시각이라는 것과 그 TODO는 <code>CLEventVk.cpp</code>를, 이미 지난 상태의 콜백은 거는 자리에서 부른다는 것은 <code>CLEvent.cpp</code>를, <code>clWaitForEvents</code>가 큐를 <code>finish</code>한다는 것은 <code>CLContextVk.cpp</code>를, 가장 오래된 묶음부터 <code>vkGetFenceStatus</code>로 묻고 안 끝났으면 <code>vkWaitForFences</code>로 기다린다는 것은 <code>CommandQueue.cpp</code>와 <code>vk_wrapper.h</code>를, 제한 시간이 <code>UINT64_MAX</code>라는 것은 <code>vk_renderer.cpp</code>를 따랐어요. Mesa의 fence 대기와 상태 조회는 <code>src/vulkan/runtime/vk_fence.c</code>를, syncobj ioctl과 플래그는 <code>vk_drm_syncobj.c</code>를, radv가 제출 때 syncobj 신호를 싣는다는 것(<code>AMDGPU_CHUNK_ID_SYNCOBJ_OUT</code> 등)은 <code>src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c</code>를 따랐어요. 리눅스에서 syncobj 대기가 콜백을 걸고 잠든다는 것과 깨우는 함수는 <code>drivers/gpu/drm/drm_syncobj.c</code>를, 제출 ioctl이 스케줄러 <code>finished</code> fence를 syncobj에 넣는다는 것은 <code>amdgpu/amdgpu_cs.c</code>를, 하드웨어 fence가 스케줄러 fence를 신호한다는 것은 <code>scheduler/sched_main.c</code>를, <code>RELEASE_MEM</code>의 이벤트·캐시 비트와 <code>INT_SEL(2)</code>, EOP 인터럽트 처리기는 <code>amdgpu/gfx_v9_0.c</code>를, 번호를 읽어 그 번호까지 신호하는 것, 예비 타이머가 걸리고 다시 걸리는 조건과 그 로그 문구, polling 대기는 <code>amdgpu/amdgpu_fence.c</code>를, fence 신호가 걸린 콜백을 그 자리에서 부른다는 것은 <code>drivers/dma-buf/dma-fence.c</code>를, 타이머 길이 <code>HZ / 2</code>는 <code>amdgpu.h</code>를 따랐어요(모두 2026-11). 6절의 ftrace 이벤트 이름은 <code>include/trace/events/dma_fence.h</code>·<code>sched.h</code>, <code>scheduler/gpu_scheduler_trace.h</code>(6.16과 6.17 태그를 비교), <code>amdgpu/amdgpu_trace.h</code>를, 찍히는 자리는 <code>dma-fence.c</code>·<code>sched_main.c</code>·<code>sched_entity.c</code>·<code>amdgpu_irq.c</code>를, syncobj 대기가 <code>dma_fence_wait_timeout</code>을 거치지 않는다는 것은 <code>drm_syncobj.c</code>를 따랐어요(리눅스 master 7.4-rc4). TraceConfig 모양은 Perfetto <code>trace_config.proto</code>·<code>ftrace_config.proto</code>를 따랐어요. Perfetto로 여는 방법은 Perfetto 문서 「Deep linking to Perfetto UI」의 postMessage 방식이고, JSON 버퍼가 이 길로 열린다는 것과 출처 확인 창(localhost는 기본 신뢰, <code>post_message_handler.ts</code>)은 2026-11-24 ui.perfetto.dev(v59.1)에서 직접 확인했어요.</p>
+<p><b>모델의 가정.</b> 6절 trace의 1박자 = 1ms는 지어낸 환산이고, trace의 구간은 모두 시뮬레이터 2의 박자 모델에서 나왔어요. 시뮬레이터 1은 compute 링 하나, 앱 스레드 하나, fence 하나(또는 둘)만 두고, 단계마다 걸리는 시간은 그리지 않았어요. 한 호출 안에서 이어지는 콜백(fence 신호 → 스케줄러 fence → 깨우기)을 따로 칸으로 펼쳤어요. 인터럽트가 IH 링을 거쳐 처리기에 닿는 길, 스케줄러가 job을 링에 쓰는 길(1·2장), GPU 리셋과 타임아웃, 64비트 번호와 한 바퀴 넘침은 뺐어요. 「인터럽트가 안 와요」는 인터럽트가 끝내 오지 않고, 타이머가 울리기 전에 GPU 일이 끝난 경우만 그렸어요. 시뮬레이터 2는 프로파일링을 켠 큐 하나, 같은 우선순위, user event 없음, 커널마다 event 하나를 두었어요. 4박자 커널, 0박자 제출, 1박자 깨어남은 지어낸 값이고, GPU에서 커널이 차례로 돈다는 것과 한 묶음의 시각이 똑같다는 것도 단순화예요. 실제 ANGLE은 <code>clSerializedExecution</code> 같은 기능 플래그나 다른 명령(맵·복사)에서도 제출과 대기를 하고, 백그라운드 스레드가 가득 차면 기다리는 등 더 많은 갈래가 있어요. 여러 VkQueue, timeline semaphore, RDNA와 GFX12의 패킷 차이, ROCm 경로는 다루지 않았어요.</p>
 
 <footer>
-<p>1판 · 2026-11-24 · Claude가 쓰고 OCL(GPT)이 사실 검토한 글이에요. 틀린 곳을 찾으면 리포 이슈로 알려 주세요.</p>
+<p>1판 · 2026-11-24 (같은 날 6절 Perfetto 시험판) · Claude가 쓰고 OCL(GPT)이 사실 검토한 글이에요. 틀린 곳을 찾으면 리포 이슈로 알려 주세요.</p>
 </footer>
 
 </main>
